@@ -212,6 +212,8 @@ def create_parser() -> argparse.ArgumentParser:
 Examples:
   %(prog)s list-tools
   %(prog)s search-symbols Math --max-results 20
+  %(prog)s search-class WebContents --max-results 10
+  %(prog)s search-method "WebContents::" --max-results 10
   %(prog)s analyze-symbol "Math::sqrt" --max-examples 3
   %(prog)s get-project-details --pretty-json
         """
@@ -308,6 +310,82 @@ Examples:
         type=int,
         help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
     )
+
+    # search-class subcommand: convenience wrapper that filters to class-like kinds
+    search_class_parser = subparsers.add_parser(
+        "search-class",
+        help="Search for C++ classes/structs/interfaces (kinds: Class, Struct, Interface)"
+    )
+    search_class_parser.add_argument(
+        "query",
+        nargs="?",
+        default="",
+        help="Search query (supports fuzzy matching and qualified names)"
+    )
+    search_class_parser.add_argument(
+        "--files",
+        nargs="+",
+        help="Limit search to specific files"
+    )
+    search_class_parser.add_argument(
+        "--max-results",
+        type=int,
+        default=100,
+        help="Maximum number of results to return (1-1000, default: 100)"
+    )
+    search_class_parser.add_argument(
+        "--include-external",
+        action="store_true",
+        help="Include symbols from external/system libraries"
+    )
+    search_class_parser.add_argument(
+        "--build-directory",
+        type=str,
+        help="Specify build directory path"
+    )
+    search_class_parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
+    )
+
+    # search-method subcommand: convenience wrapper that filters to method-like kinds
+    search_method_parser = subparsers.add_parser(
+        "search-method",
+        help="Search for C++ methods/functions/constructors (kinds: Method, Function, Constructor)"
+    )
+    search_method_parser.add_argument(
+        "query",
+        nargs="?",
+        default="",
+        help="Search query (supports fuzzy matching and qualified names)"
+    )
+    search_method_parser.add_argument(
+        "--files",
+        nargs="+",
+        help="Limit search to specific files"
+    )
+    search_method_parser.add_argument(
+        "--max-results",
+        type=int,
+        default=100,
+        help="Maximum number of results to return (1-1000, default: 100)"
+    )
+    search_method_parser.add_argument(
+        "--include-external",
+        action="store_true",
+        help="Include symbols from external/system libraries"
+    )
+    search_method_parser.add_argument(
+        "--build-directory",
+        type=str,
+        help="Specify build directory path"
+    )
+    search_method_parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
+    )
     
     # analyze-symbol subcommand
     analyze_parser = subparsers.add_parser(
@@ -375,6 +453,28 @@ Examples:
     return parser
 
 
+def _build_search_arguments(args, kinds: Optional[List[str]] = None) -> Dict:
+    """Build the arguments dict for a search_symbols call from parsed CLI args."""
+    arguments = {"query": args.query}
+
+    if kinds:
+        arguments["kinds"] = kinds
+    elif getattr(args, 'kinds', None):
+        arguments["kinds"] = args.kinds
+    if getattr(args, 'files', None):
+        arguments["files"] = args.files
+    if getattr(args, 'max_results', 100) != 100:
+        arguments["max_results"] = args.max_results
+    if getattr(args, 'include_external', False):
+        arguments["include_external"] = args.include_external
+    if getattr(args, 'build_directory', None):
+        arguments["build_directory"] = args.build_directory
+    if getattr(args, 'wait_timeout', None) is not None:
+        arguments["wait_timeout"] = args.wait_timeout
+
+    return arguments
+
+
 def main():
     """Main entry point"""
     parser = create_parser()
@@ -405,23 +505,19 @@ def main():
             response = client.list_tools()
             
         elif args.command == "search-symbols":
-            arguments = {"query": args.query}
+            response = client.call_tool("search_symbols", _build_search_arguments(args))
             
-            # Add optional parameters
-            if args.kinds:
-                arguments["kinds"] = args.kinds
-            if args.files:
-                arguments["files"] = args.files
-            if args.max_results != 100:
-                arguments["max_results"] = args.max_results
-            if args.include_external:
-                arguments["include_external"] = args.include_external
-            if args.build_directory:
-                arguments["build_directory"] = args.build_directory
-            if args.wait_timeout is not None:
-                arguments["wait_timeout"] = args.wait_timeout
-                
-            response = client.call_tool("search_symbols", arguments)
+        elif args.command == "search-class":
+            response = client.call_tool(
+                "search_symbols",
+                _build_search_arguments(args, kinds=["Class", "Struct", "Interface"]),
+            )
+            
+        elif args.command == "search-method":
+            response = client.call_tool(
+                "search_symbols",
+                _build_search_arguments(args, kinds=["Method", "Function", "Constructor"]),
+            )
             
         elif args.command == "analyze-symbol":
             arguments = {"symbol": args.symbol}
@@ -558,7 +654,7 @@ def _format_rich_output(command: str, response: Dict, show_code: bool = True, sh
         # Format based on command type
         if command == "list-tools":
             _format_tools_list(console, data)
-        elif command == "search-symbols":
+        elif command in ("search-symbols", "search-class", "search-method"):
             _format_symbols_search(console, data)
         elif command == "analyze-symbol":
             _format_symbol_analysis(console, data, show_code=show_code, show_all_members=show_all_members)
