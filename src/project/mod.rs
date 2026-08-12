@@ -18,6 +18,7 @@ pub mod workspace_session;
 
 pub use cmake_provider::CmakeProvider;
 
+pub use compilation_database::BuildOptions;
 pub use compilation_database::CompilationDatabase;
 
 pub use component::ProjectComponent;

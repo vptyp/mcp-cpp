@@ -3,7 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::project::{CompilationDatabase, ProjectComponent};
+use crate::project::{BuildOptions, CompilationDatabase, ProjectComponent};
+
+/// Aggregate compiler options for a component from its compile_commands.json.
+///
+/// Returns `None` if the component has no compilation database or it can't be
+/// read/parsed. Uses a bounded sample to stay fast on very large databases.
+fn aggregate_compiler_options(component: &ProjectComponent) -> Option<BuildOptions> {
+    CompilationDatabase::aggregate_build_options_from_path(
+        &component.compilation_database_path,
+        crate::project::compilation_database::DEFAULT_BUILD_OPTIONS_SAMPLE,
+    )
+    .ok()
+}
 
 /// View of a project component with optional build options
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +46,11 @@ pub struct ProjectComponentView {
     /// Count of build options (present in short view when build_options is None)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_options_count: Option<usize>,
+
+    /// Aggregated compiler options extracted from compile_commands.json
+    /// (defines, include paths, language standard, optimization, flags)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compiler_options: Option<BuildOptions>,
 }
 
 /// View of a project workspace with optional detailed information
@@ -170,6 +187,7 @@ impl ProjectWorkspace {
                 build_type: component.build_type.clone(),
                 build_options: None, // Excluded in short view
                 build_options_count: Some(component.build_options.len()),
+                compiler_options: aggregate_compiler_options(component),
             })
             .collect();
 
@@ -199,6 +217,7 @@ impl ProjectWorkspace {
                 build_type: component.build_type.clone(),
                 build_options: Some(component.build_options.clone()), // Included in full view
                 build_options_count: Some(component.build_options.len()),
+                compiler_options: aggregate_compiler_options(component),
             })
             .collect();
 

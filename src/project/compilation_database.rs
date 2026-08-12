@@ -1,12 +1,39 @@
 use json_compilation_db::Entry;
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Type alias for bidirectional path mappings
 /// (original_path -> canonical_path, canonical_path -> original_path)
 pub type PathMappings = (HashMap<PathBuf, PathBuf>, HashMap<PathBuf, PathBuf>);
+
+/// Aggregated compiler options extracted from a compilation database.
+///
+/// These are derived from the `arguments` field of compilation entries and
+/// aggregated across a bounded sample of entries (see
+/// [`CompilationDatabase::aggregate_build_options_from_path`]).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BuildOptions {
+    /// Unique preprocessor defines (`-DNAME=VALUE`)
+    pub defines: Vec<String>,
+    /// Unique include paths (`-I/path`, `-isystem /path`)
+    pub include_paths: Vec<String>,
+    /// Most common language standard (`-std=...`)
+    pub language_standard: Option<String>,
+    /// Most common optimization level (`-O0`..`-O3`, `-Os`)
+    pub optimization: Option<String>,
+    /// Other unique compiler flags (e.g. `-fPIC`, `-Wall`)
+    pub flags: Vec<String>,
+    /// Number of compilation entries sampled to build this summary
+    pub entries_sampled: usize,
+}
+
+/// Default number of compilation entries to sample when aggregating build options.
+///
+/// A bounded sample keeps the aggregation fast (streaming, reads only the head of
+/// the file) and representative, without loading a potentially huge database.
+pub const DEFAULT_BUILD_OPTIONS_SAMPLE: usize = 200;
 
 #[derive(Error, Debug)]
 pub enum CompilationDatabaseError {
@@ -109,6 +136,76 @@ impl CompilationDatabase {
         Ok(canonical_files)
     }
 
+    /// Aggregate compiler options from a compilation database file.
+    ///
+    /// Streams the JSON file and parses only the first `max_entries` entries, so it
+    /// stays fast and memory-bounded even for very large databases (e.g. Chromium's
+    /// 553 MB compile_commands.json). Returns an empty [`BuildOptions`] if the file
+    /// can't be read or contains no parseable entries.
+    pub fn aggregate_build_options_from_path(
+        path: &Path,
+        max_entries: usize,
+    ) -> Result<BuildOptions, CompilationDatabaseError> {
+        let file = std::fs::File::open(path).map_err(|e| CompilationDatabaseError::ReadError {
+            error: e.to_string(),
+        })?;
+        let reader = std::io::BufReader::new(file);
+
+        let mut defines = HashSet::new();
+        let mut include_paths = HashSet::new();
+        let mut flags = HashSet::new();
+        let mut std_counts: HashMap<String, usize> = HashMap::new();
+        let mut opt_counts: HashMap<String, usize> = HashMap::new();
+        let mut entries_sampled = 0usize;
+
+        // `json_compilation_db::read` streams a JSON array of entries, so we only
+        // parse the head of the file and stop after `max_entries`.
+        for entry in json_compilation_db::read(reader) {
+            if entries_sampled >= max_entries {
+                break;
+            }
+            let entry = entry.map_err(|e| CompilationDatabaseError::ParseError {
+                error: e.to_string(),
+            })?;
+            entries_sampled += 1;
+
+            let mut args = entry.arguments.iter();
+            while let Some(arg) = args.next() {
+                if let Some(def) = arg.strip_prefix("-D") {
+                    defines.insert(def.to_string());
+                } else if let Some(inc) = arg.strip_prefix("-I") {
+                    include_paths.insert(inc.to_string());
+                } else if arg == "-isystem" {
+                    if let Some(inc) = args.next() {
+                        include_paths.insert(inc.to_string());
+                    }
+                } else if let Some(std) = arg.strip_prefix("-std=") {
+                    *std_counts.entry(std.to_string()).or_insert(0) += 1;
+                } else if arg.starts_with("-O") && arg.len() <= 3 {
+                    *opt_counts.entry(arg.clone()).or_insert(0) += 1;
+                } else if arg == "-c" {
+                    // compile-only, not a build option
+                } else if arg == "-o" {
+                    // output-file flag; skip its separate argument too
+                    let _ = args.next();
+                } else if arg.starts_with("-o") && arg.len() > 2 {
+                    // -o<file>, not a build option
+                } else if arg.starts_with('-') {
+                    flags.insert(arg.to_string());
+                }
+            }
+        }
+
+        Ok(BuildOptions {
+            defines: sorted_unique(defines),
+            include_paths: sorted_unique(include_paths),
+            language_standard: most_common(&std_counts),
+            optimization: most_common(&opt_counts),
+            flags: sorted_unique(flags),
+            entries_sampled,
+        })
+    }
+
     /// Derive the source root directory from the compilation database entries
     ///
     /// Computes the common ancestor directory of all source file paths in the
@@ -205,6 +302,21 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
     result
 }
 
+/// Sort a set of strings into a stable `Vec<String>`.
+fn sorted_unique(set: HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = set.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Return the key with the highest count, if any.
+fn most_common(counts: &HashMap<String, usize>) -> Option<String> {
+    counts
+        .iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(k, _)| k.clone())
+}
+
 /// Custom serialization that only outputs the path field
 ///
 /// This ensures that when the CompilationDatabase is serialized (e.g., in JSON responses),
@@ -262,5 +374,72 @@ mod tests {
         let a = Path::new("/proj/src/a.cpp");
         let b = Path::new("/other/lib/b.cpp");
         assert_eq!(common_ancestor(a, b), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn test_aggregate_build_options_from_path() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("mcp_cc_agg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("compile_commands.json");
+        let json = r#"[
+            {"file":"a.cpp","directory":"/proj","arguments":["c++","-std=c++17","-O2","-DNDEBUG","-Iinclude","-fPIC","-c","a.cpp"]},
+            {"file":"b.cpp","directory":"/proj","arguments":["c++","-std=c++17","-O2","-DUSE_AURA","-isystem","/sys/include","-Wall","-c","b.cpp"]},
+            {"file":"c.cpp","directory":"/proj","arguments":["c++","-std=c++20","-O0","-DNDEBUG","-Iinclude","-c","c.cpp"]}
+        ]"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let opts = CompilationDatabase::aggregate_build_options_from_path(&path, 200).unwrap();
+
+        assert_eq!(opts.entries_sampled, 3);
+        assert_eq!(opts.defines, vec!["NDEBUG", "USE_AURA"]);
+        assert_eq!(opts.include_paths, vec!["/sys/include", "include"]);
+        assert_eq!(opts.language_standard.as_deref(), Some("c++17"));
+        assert_eq!(opts.optimization.as_deref(), Some("-O2"));
+        assert!(opts.flags.contains(&"-fPIC".to_string()));
+        assert!(opts.flags.contains(&"-Wall".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_aggregate_build_options_respects_max_entries() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("mcp_cc_agg2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("compile_commands.json");
+        let mut entries = Vec::new();
+        for i in 0..10 {
+            entries.push(format!(
+                "{{\"file\":\"f{}.cpp\",\"directory\":\"/proj\",\"arguments\":[\"c++\",\"-DOPT{}\",\"-c\",\"f{}.cpp\"]}}",
+                i, i, i
+            ));
+        }
+        let json = format!("[{}]", entries.join(","));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let opts = CompilationDatabase::aggregate_build_options_from_path(&path, 3).unwrap();
+        assert_eq!(opts.entries_sampled, 3);
+        assert_eq!(opts.defines, vec!["OPT0", "OPT1", "OPT2"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_aggregate_build_options_missing_file() {
+        let err = CompilationDatabase::aggregate_build_options_from_path(
+            Path::new("/nonexistent/compile_commands.json"),
+            10,
+        );
+        assert!(matches!(
+            err,
+            Err(CompilationDatabaseError::ReadError { .. })
+        ));
     }
 }
