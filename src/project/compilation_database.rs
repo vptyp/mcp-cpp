@@ -109,6 +109,35 @@ impl CompilationDatabase {
         Ok(canonical_files)
     }
 
+    /// Derive the source root directory from the compilation database entries
+    ///
+    /// Computes the common ancestor directory of all source file paths in the
+    /// database. This is used to determine the project source root for build
+    /// systems that don't provide explicit project metadata (e.g., GN, Bazel,
+    /// xmake) but still export a compile_commands.json.
+    pub fn derive_source_root(&self) -> Result<PathBuf, CompilationDatabaseError> {
+        let files = self.canonical_source_files()?;
+        if files.is_empty() {
+            return Err(CompilationDatabaseError::EmptyDatabase);
+        }
+
+        // Compute the common ancestor directory of all source files. For a single
+        // file the common ancestor is the file itself, so use its parent directory
+        // to ensure we always return a directory (the source root).
+        let mut common = files[0].clone();
+        if files.len() == 1 {
+            common = files[0]
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| files[0].clone());
+        } else {
+            for file in &files[1..] {
+                common = common_ancestor(&common, file);
+            }
+        }
+        Ok(common)
+    }
+
     /// Get bidirectional mappings between original and canonical paths
     ///
     /// Returns (original -> canonical, canonical -> original) mappings.
@@ -157,6 +186,25 @@ impl CompilationDatabase {
     }
 }
 
+/// Compute the longest common directory prefix of two paths
+///
+/// Returns the deepest directory that is an ancestor of both paths. Used to
+/// derive a project source root from a set of source file paths.
+fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
+    let a_components: Vec<_> = a.components().collect();
+    let b_components: Vec<_> = b.components().collect();
+
+    let mut result = PathBuf::new();
+    for (x, y) in a_components.iter().zip(b_components.iter()) {
+        if x == y {
+            result.push(x.as_os_str());
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 /// Custom serialization that only outputs the path field
 ///
 /// This ensures that when the CompilationDatabase is serialized (e.g., in JSON responses),
@@ -167,5 +215,52 @@ impl Serialize for CompilationDatabase {
         S: Serializer,
     {
         self.path.serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use json_compilation_db::Entry;
+
+    fn entry(file: &str, directory: &str) -> Entry {
+        Entry {
+            file: PathBuf::from(file),
+            arguments: vec![],
+            directory: PathBuf::from(directory),
+            output: None,
+        }
+    }
+
+    #[test]
+    fn test_derive_source_root_common_ancestor() {
+        let db = CompilationDatabase::from_entries(vec![
+            entry("/proj/src/a.cpp", "/proj/build"),
+            entry("/proj/src/b.cpp", "/proj/build"),
+            entry("/proj/src/sub/c.cpp", "/proj/build"),
+        ]);
+        let root = db.derive_source_root().unwrap();
+        assert_eq!(root, PathBuf::from("/proj/src"));
+    }
+
+    #[test]
+    fn test_derive_source_root_single_file() {
+        let db = CompilationDatabase::from_entries(vec![entry("/proj/src/a.cpp", "/proj/build")]);
+        let root = db.derive_source_root().unwrap();
+        assert_eq!(root, PathBuf::from("/proj/src"));
+    }
+
+    #[test]
+    fn test_derive_source_root_empty_database() {
+        let db = CompilationDatabase::from_entries(vec![]);
+        assert!(db.derive_source_root().is_err());
+    }
+
+    #[test]
+    fn test_common_ancestor_disjoint_paths() {
+        // Disjoint paths share only the root
+        let a = Path::new("/proj/src/a.cpp");
+        let b = Path::new("/other/lib/b.cpp");
+        assert_eq!(common_ancestor(a, b), PathBuf::from("/"));
     }
 }

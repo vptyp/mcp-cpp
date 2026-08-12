@@ -9,7 +9,17 @@ use crate::clangd::index::idx_parser::{IdxParseError, IdxParser};
 use crate::io::file_system::FileSystemTrait;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace};
+
+/// How long a directory listing is reused before being refreshed.
+///
+/// During a rescan over a large build directory, `read_index` is called once per
+/// source file and each call would otherwise re-list the index directory. Caching
+/// the listing for a short window turns that O(N*M) syscall storm into a single
+/// listing plus in-memory scans.
+const LISTING_CACHE_TTL: Duration = Duration::from_secs(1);
 
 /// Filesystem-based index storage implementation with dependency injection
 pub struct FilesystemIndexStorage<F: FileSystemTrait> {
@@ -19,6 +29,8 @@ pub struct FilesystemIndexStorage<F: FileSystemTrait> {
     expected_version: u32,
     /// Filesystem implementation for dependency injection
     filesystem: F,
+    /// Cache of the last successful directory listing (with timestamp)
+    listing_cache: Mutex<Option<(Instant, Vec<PathBuf>)>>,
 }
 
 impl<F: FileSystemTrait + 'static> FilesystemIndexStorage<F> {
@@ -33,6 +45,7 @@ impl<F: FileSystemTrait + 'static> FilesystemIndexStorage<F> {
             index_directory,
             expected_version,
             filesystem,
+            listing_cache: Mutex::new(None),
         }
     }
 
@@ -202,6 +215,16 @@ impl<F: FileSystemTrait + 'static> IndexStorage for FilesystemIndexStorage<F> {
     async fn list_index_files(&self, index_dir: &Path) -> Result<Vec<PathBuf>, IndexError> {
         debug!("Listing index files in: {:?}", index_dir);
 
+        // Serve from cache if fresh (only for the storage's own index directory).
+        // This avoids re-listing the directory for every source file during a rescan.
+        if index_dir == self.index_directory
+            && let Ok(guard) = self.listing_cache.lock()
+            && let Some((ts, files)) = guard.as_ref()
+            && ts.elapsed() < LISTING_CACHE_TTL
+        {
+            return Ok(files.clone());
+        }
+
         // Check if directory exists using filesystem trait
         let path = index_dir.to_path_buf();
         let filesystem = self.filesystem.clone();
@@ -234,8 +257,46 @@ impl<F: FileSystemTrait + 'static> IndexStorage for FilesystemIndexStorage<F> {
             }
         }
 
+        // Cache the successful listing for the storage's own index directory
+        if index_dir == self.index_directory
+            && let Ok(mut guard) = self.listing_cache.lock()
+        {
+            *guard = Some((Instant::now(), index_files.clone()));
+        }
+
         debug!("Found {} index files", index_files.len());
         Ok(index_files)
+    }
+
+    async fn has_index_files(&self) -> bool {
+        // A single directory listing is enough to determine whether any index
+        // files exist. This avoids the O(N) per-file directory listings that
+        // would otherwise happen for large build directories.
+        self.list_index_files(&self.index_directory)
+            .await
+            .map(|files| !files.is_empty())
+            .unwrap_or(false)
+    }
+
+    async fn indexed_source_files(&self) -> Result<std::collections::HashSet<PathBuf>, IndexError> {
+        let index_files = self.list_index_files(&self.index_directory).await?;
+        let mut sources = std::collections::HashSet::new();
+        for index_file in index_files {
+            if let Some(name) = index_file.file_name().and_then(|s| s.to_str()) {
+                // Index files are named `<source_filename>.<HASH>.idx`; strip the
+                // `.idx` suffix and the trailing 16-hex-digit hash to recover the
+                // source file name.
+                if let Some(stripped) = name.strip_suffix(".idx")
+                    && let Some(dot) = stripped.rfind('.')
+                {
+                    let hash = &stripped[dot + 1..];
+                    if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                        sources.insert(PathBuf::from(&stripped[..dot]));
+                    }
+                }
+            }
+        }
+        Ok(sources)
     }
 
     fn supports_version(&self, version: u32) -> bool {
@@ -318,5 +379,51 @@ mod tests {
 
         let result = storage.list_index_files(&nonexistent).await;
         assert!(matches!(result, Err(IndexError::DirectoryNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_has_index_files_empty_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let filesystem = TestFileSystem::new();
+        // Add directory to test filesystem (directories are tracked via file paths)
+        filesystem.set_file_content(
+            temp_dir.path().join(".keep"),
+            "",
+            std::time::SystemTime::now(),
+        );
+        let storage = FilesystemIndexStorage::new(temp_dir.path().to_path_buf(), 19, filesystem);
+
+        assert!(!storage.has_index_files().await);
+    }
+
+    #[tokio::test]
+    async fn test_has_index_files_nonexistent_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let filesystem = TestFileSystem::new();
+        let storage = FilesystemIndexStorage::new(
+            temp_dir.path().join("nonexistent").to_path_buf(),
+            19,
+            filesystem,
+        );
+
+        assert!(!storage.has_index_files().await);
+    }
+
+    #[tokio::test]
+    async fn test_list_index_files_cached() {
+        let temp_dir = TempDir::new().unwrap();
+        let filesystem = TestFileSystem::new();
+        filesystem.set_file_content(
+            temp_dir.path().join("main.cpp.ABC.idx"),
+            "",
+            std::time::SystemTime::now(),
+        );
+        let storage = FilesystemIndexStorage::new(temp_dir.path().to_path_buf(), 19, filesystem);
+
+        // Repeated listings within the TTL should return consistent results
+        let first = storage.list_index_files(temp_dir.path()).await.unwrap();
+        let second = storage.list_index_files(temp_dir.path()).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
     }
 }

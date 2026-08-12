@@ -11,6 +11,8 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::clangd::version::ClangdVersion;
+use crate::project::compilation_database::CompilationDatabase;
+use crate::project::component::ProjectComponent;
 use crate::project::component_session::ComponentSession;
 use crate::project::{ProjectError, ProjectScanner, ProjectWorkspace};
 
@@ -107,14 +109,31 @@ impl WorkspaceSession {
                         discovered_component
                     }
                     None => {
-                        let workspace = self.workspace.lock().await;
-                        let available_dirs = workspace.get_build_dirs();
-                        return Err(ProjectError::SessionCreation(format!(
-                            "No valid project component found at build directory: '{}'. Scan root: '{}'. Use get_project_details to discover available build directories. Available directories: {:?}. Ensure you're using absolute paths from that output to avoid path concatenation issues.",
-                            build_dir.display(),
-                            workspace.project_root_path.display(),
-                            available_dirs
-                        )));
+                        // Provider discovery found nothing - fall back to synthesizing a
+                        // component directly from a bare compile_commands.json. This supports
+                        // build systems (GN, Bazel, xmake, ...) that export a compilation
+                        // database but aren't recognized by any provider.
+                        match synthesize_component_from_compile_commands(&build_dir) {
+                            Some(component) => {
+                                let mut workspace = self.workspace.lock().await;
+                                workspace.add_component(component.clone());
+                                info!(
+                                    "Synthesized component from compile_commands.json for build dir: {}",
+                                    build_dir.display()
+                                );
+                                component
+                            }
+                            None => {
+                                let workspace = self.workspace.lock().await;
+                                let available_dirs = workspace.get_build_dirs();
+                                return Err(ProjectError::SessionCreation(format!(
+                                    "No valid project component found at build directory: '{}'. Scan root: '{}'. Use get_project_details to discover available build directories. Available directories: {:?}. Ensure you're using absolute paths from that output to avoid path concatenation issues.",
+                                    build_dir.display(),
+                                    workspace.project_root_path.display(),
+                                    available_dirs
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -160,6 +179,38 @@ impl WorkspaceSession {
     pub fn get_workspace(&self) -> &Arc<Mutex<ProjectWorkspace>> {
         &self.workspace
     }
+}
+
+/// Synthesize a `ProjectComponent` directly from a bare `compile_commands.json`
+/// in the given build directory.
+///
+/// This is the fallback used when no provider recognizes the build directory. It
+/// anchors the component on the build directory (which clangd needs via
+/// `--compile-commands-dir`) and derives the source root from the common
+/// ancestor of the source file paths in the database, rather than assuming the
+/// build directory is the source root.
+///
+/// Returns `None` if the directory has no `compile_commands.json`, the database
+/// can't be parsed, or the derived component fails validation.
+fn synthesize_component_from_compile_commands(build_dir: &Path) -> Option<ProjectComponent> {
+    let db_path = build_dir.join("compile_commands.json");
+    if !db_path.exists() {
+        return None;
+    }
+
+    let db = CompilationDatabase::new(db_path.clone()).ok()?;
+    let source_root = db.derive_source_root().ok()?;
+
+    ProjectComponent::new(
+        build_dir.to_path_buf(),
+        source_root,
+        db_path,
+        "compile_commands".to_string(),
+        String::new(),
+        String::new(),
+        HashMap::new(),
+    )
+    .ok()
 }
 
 impl Drop for WorkspaceSession {
@@ -312,5 +363,72 @@ mod tests {
             let workspace = workspace_session.get_workspace().lock().await;
             assert_eq!(workspace.component_count(), 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use std::fs;
+
+    fn write_db(build_dir: &Path, files: &[&str]) {
+        let entries: Vec<serde_json::Value> = files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "file": f,
+                    "directory": build_dir.to_string_lossy(),
+                    "arguments": ["c++", "-c", f]
+                })
+            })
+            .collect();
+        fs::write(
+            build_dir.join("compile_commands.json"),
+            serde_json::to_string(&entries).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_synthesize_component_from_compile_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let build_dir = temp.path().join("out");
+        fs::create_dir_all(&build_dir).unwrap();
+        let src_dir = temp.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        // Create source files so canonicalization resolves them
+        fs::write(src_dir.join("a.cpp"), "").unwrap();
+        fs::write(src_dir.join("b.cpp"), "").unwrap();
+
+        write_db(
+            &build_dir,
+            &[
+                src_dir.join("a.cpp").to_str().unwrap(),
+                src_dir.join("b.cpp").to_str().unwrap(),
+            ],
+        );
+
+        let component = synthesize_component_from_compile_commands(&build_dir).unwrap();
+        assert_eq!(component.build_dir_path, build_dir);
+        assert_eq!(component.source_root_path, src_dir);
+        assert_eq!(component.provider_type, "compile_commands");
+        assert!(component.compilation_database_path.exists());
+    }
+
+    #[test]
+    fn test_synthesize_component_missing_db() {
+        let temp = tempfile::tempdir().unwrap();
+        let build_dir = temp.path().join("out");
+        fs::create_dir_all(&build_dir).unwrap();
+        assert!(synthesize_component_from_compile_commands(&build_dir).is_none());
+    }
+
+    #[test]
+    fn test_synthesize_component_invalid_db() {
+        let temp = tempfile::tempdir().unwrap();
+        let build_dir = temp.path().join("out");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("compile_commands.json"), "not json").unwrap();
+        assert!(synthesize_component_from_compile_commands(&build_dir).is_none());
     }
 }

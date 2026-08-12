@@ -964,6 +964,23 @@ impl ComponentIndexMonitor {
             return Ok(());
         }
 
+        // Short-circuit: if there are no index files on disk, there is nothing to
+        // validate. This avoids O(N) per-file directory listings for fresh build
+        // directories (e.g., large projects like Chromium with 70k+ files).
+        if !state.index_reader.has_index_files().await {
+            debug!(
+                "No index files on disk for build dir: {} - skipping rescan",
+                self.build_directory.display()
+            );
+            return Ok(());
+        }
+
+        // Build the set of source file names that have index files from a single
+        // directory listing. Only these files can possibly be validated, so we
+        // avoid per-file filesystem operations (e.g., canonicalization) for the
+        // many source files that have no index file at all.
+        let indexed_sources = state.index_reader.indexed_source_files().await;
+
         debug!(
             "Found {} pending files to validate for build dir: {}",
             pending_files.len(),
@@ -975,6 +992,14 @@ impl ComponentIndexMonitor {
         let mut validation_errors = Vec::new();
 
         for source_file in &pending_files {
+            // Skip files that have no index file on disk - they are genuinely
+            // pending and don't need a filesystem check.
+            if let Some(name) = source_file.file_name()
+                && !indexed_sources.contains(Path::new(name))
+            {
+                continue;
+            }
+
             match state.index_reader.read_index_for_file(source_file).await {
                 Ok(index_entry) => {
                     let validation_result = self.validate_index_entry(source_file, &index_entry);
@@ -1315,6 +1340,12 @@ mod tests {
     #[tokio::test]
     async fn test_indexing_completion_with_partial_coverage() {
         let mut mock_reader = MockIndexReaderTrait::new();
+        mock_reader
+            .expect_has_index_files()
+            .returning(|| Box::pin(async { true }));
+        mock_reader.expect_indexed_source_files().returning(|| {
+            Box::pin(async { std::collections::HashSet::from([PathBuf::from("utils.cpp")]) })
+        });
 
         // Set up mock expectations for the rescan operation
         // The rescan will check the remaining pending file (utils.cpp)
@@ -1532,6 +1563,12 @@ mod tests {
     #[tokio::test]
     async fn test_overall_completed_with_rescanning() {
         let mut mock_reader = MockIndexReaderTrait::new();
+        mock_reader
+            .expect_has_index_files()
+            .returning(|| Box::pin(async { true }));
+        mock_reader.expect_indexed_source_files().returning(|| {
+            Box::pin(async { std::collections::HashSet::from([PathBuf::from("utils.cpp")]) })
+        });
 
         // Set up mock expectations for the rescan operation
         // The rescan will check pending files for existing index files
@@ -1707,6 +1744,12 @@ mod tests {
         use crate::project::index::trigger::MockIndexTrigger;
 
         let mut mock_reader = MockIndexReaderTrait::new();
+        mock_reader
+            .expect_has_index_files()
+            .returning(|| Box::pin(async { true }));
+        mock_reader.expect_indexed_source_files().returning(|| {
+            Box::pin(async { std::collections::HashSet::from([PathBuf::from("main.cpp")]) })
+        });
 
         // Expect the initial disk scan call during ComponentIndexMonitor creation
         mock_reader
@@ -1788,10 +1831,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_initial_scan_skipped_when_no_index_files() {
+        let mut mock_reader = MockIndexReaderTrait::new();
+        // No index files on disk -> the rescan should short-circuit
+        mock_reader
+            .expect_has_index_files()
+            .returning(|| Box::pin(async { false }));
+        // read_index_for_file must NOT be called when the scan is skipped
+        mock_reader.expect_read_index_for_file().never();
+
+        let mock_reader = Arc::new(mock_reader) as Arc<dyn IndexReaderTrait>;
+        let compilation_db = create_test_compilation_db();
+        let build_dir = PathBuf::from("/test/project/build");
+
+        // new_with_trigger performs the initial disk scan during creation
+        let monitor = ComponentIndexMonitor::new_with_trigger(
+            build_dir,
+            Arc::new(compilation_db.clone()),
+            mock_reader,
+            &create_test_clangd_version(),
+            None,
+        )
+        .await
+        .expect("Failed to create ComponentIndexMonitor");
+
+        // No files should have been marked as indexed (scan was skipped)
+        let state = monitor.get_component_state().await;
+        assert_eq!(state.indexed_cdb_files, 0);
+    }
+
+    #[tokio::test]
     async fn test_trigger_initial_indexing() {
         use crate::project::index::trigger::MockIndexTrigger;
 
         let mut mock_reader = MockIndexReaderTrait::new();
+        mock_reader
+            .expect_has_index_files()
+            .returning(|| Box::pin(async { true }));
+        mock_reader.expect_indexed_source_files().returning(|| {
+            Box::pin(async { std::collections::HashSet::from([PathBuf::from("main.cpp")]) })
+        });
 
         // Expect the initial disk scan call during ComponentIndexMonitor creation
         mock_reader

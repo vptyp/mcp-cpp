@@ -100,6 +100,20 @@ pub trait IndexStorage: Send + Sync {
     /// List all index files in a directory
     async fn list_index_files(&self, index_dir: &Path) -> Result<Vec<PathBuf>, IndexError>;
 
+    /// Check if there are any index files available on disk
+    ///
+    /// This is a cheap check used to short-circuit expensive per-file scans when
+    /// no index files exist yet (e.g., a fresh build directory). Implementations
+    /// should avoid iterating over every source file.
+    async fn has_index_files(&self) -> bool;
+
+    /// Get the set of source file names that have index files on disk
+    ///
+    /// Computed from a single directory listing. Used to avoid per-file
+    /// filesystem operations (e.g., canonicalization) for source files that
+    /// have no index file at all.
+    async fn indexed_source_files(&self) -> Result<std::collections::HashSet<PathBuf>, IndexError>;
+
     /// Check if storage supports a specific index format version
     fn supports_version(&self, version: u32) -> bool;
 

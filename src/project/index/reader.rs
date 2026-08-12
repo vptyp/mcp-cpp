@@ -91,6 +91,18 @@ pub trait IndexReaderTrait: Send + Sync {
     /// Read index for a specific source file with automatic staleness detection
     async fn read_index_for_file(&self, source_path: &Path) -> Result<IndexEntry, IndexError>;
 
+    /// Check if there are any index files available on disk
+    ///
+    /// Used to short-circuit expensive per-file scans when no index files exist
+    /// yet (e.g., a fresh build directory).
+    async fn has_index_files(&self) -> bool;
+
+    /// Get the set of source file names that have index files on disk
+    ///
+    /// Computed from a single directory listing. Used to avoid per-file
+    /// filesystem operations for source files that have no index file at all.
+    async fn indexed_source_files(&self) -> std::collections::HashSet<PathBuf>;
+
     /// Clear the cache
     async fn clear_cache(&self);
 
@@ -228,6 +240,19 @@ impl IndexReader {
         cache.insert(path, entry);
     }
 
+    /// Check if there are any index files available on disk
+    pub async fn has_index_files(&self) -> bool {
+        self.storage.has_index_files().await
+    }
+
+    /// Get the set of source file names that have index files on disk
+    pub async fn indexed_source_files(&self) -> std::collections::HashSet<PathBuf> {
+        self.storage
+            .indexed_source_files()
+            .await
+            .unwrap_or_default()
+    }
+
     /// Clear the cache
     pub async fn clear_cache(&self) {
         let mut cache = self.cache.write().await;
@@ -258,6 +283,14 @@ impl IndexReader {
 impl IndexReaderTrait for IndexReader {
     async fn read_index_for_file(&self, source_path: &Path) -> Result<IndexEntry, IndexError> {
         self.read_index_for_file(source_path).await
+    }
+
+    async fn has_index_files(&self) -> bool {
+        self.has_index_files().await
+    }
+
+    async fn indexed_source_files(&self) -> std::collections::HashSet<PathBuf> {
+        self.indexed_source_files().await
     }
 
     async fn clear_cache(&self) {
