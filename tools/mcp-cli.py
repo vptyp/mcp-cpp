@@ -453,6 +453,49 @@ Examples:
     return parser
 
 
+# LSP SymbolKind numeric values -> readable PascalCase names.
+# The server emits numeric kinds (e.g. 5 = Class) which are opaque to LLMs,
+# so we translate them to readable names in the CLI output.
+_SYMBOL_KINDS = {
+    1: "File", 2: "Module", 3: "Namespace", 4: "Package", 5: "Class",
+    6: "Method", 7: "Property", 8: "Field", 9: "Constructor", 10: "Enum",
+    11: "Interface", 12: "Function", 13: "Variable", 14: "Constant",
+    15: "String", 16: "Number", 17: "Boolean", 18: "Array", 19: "Object",
+    20: "Key", 21: "Null", 22: "EnumMember", 23: "Struct", 24: "Event",
+    25: "Operator", 26: "TypeParameter",
+}
+
+
+def _translate_symbol_kinds(obj: Any) -> Any:
+    """Recursively translate numeric LSP SymbolKind 'kind' fields to readable names."""
+    if isinstance(obj, dict):
+        if "kind" in obj and isinstance(obj["kind"], int) and obj["kind"] in _SYMBOL_KINDS:
+            obj["kind"] = _SYMBOL_KINDS[obj["kind"]]
+        for value in obj.values():
+            _translate_symbol_kinds(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            _translate_symbol_kinds(item)
+    return obj
+
+
+def _translate_response_kinds(response: Dict) -> Dict:
+    """Translate numeric symbol kinds in the tool result's 'text' field."""
+    result = response.get("result")
+    if not result or "content" not in result:
+        return response
+    for content_item in result["content"]:
+        if not isinstance(content_item, dict) or "text" not in content_item:
+            continue
+        try:
+            data = json.loads(content_item["text"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        _translate_symbol_kinds(data)
+        content_item["text"] = json.dumps(data)
+    return response
+
+
 def _build_search_arguments(args, kinds: Optional[List[str]] = None) -> Dict:
     """Build the arguments dict for a search_symbols call from parsed CLI args."""
     arguments = {"query": args.query}
@@ -543,6 +586,9 @@ def main():
             if hasattr(args, 'include_details') and args.include_details:
                 arguments["include_details"] = True
             response = client.call_tool("get_project_details", arguments)
+        
+        # Translate numeric symbol kinds to readable names for LLM-friendly output
+        _translate_response_kinds(response)
         
         # Output the response
         if args.raw_output:
