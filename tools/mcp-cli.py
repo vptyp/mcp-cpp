@@ -8,10 +8,12 @@ argument handling and pretty-formatted output.
 """
 
 import argparse
+import errno
 import json
 import subprocess
 import sys
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 from uuid import uuid4
@@ -37,8 +39,17 @@ class McpCliError(Exception):
 class McpClient:
     """JSON-RPC client for communicating with the MCP server"""
     
-    def __init__(self, server_path: str):
+    def __init__(
+        self,
+        server_path: Optional[str] = None,
+        fifo_path: Optional[str] = None,
+        output_path: Optional[str] = None,
+        attach_timeout: float = 30.0,
+    ):
         self.server_path = server_path
+        self.fifo_path = fifo_path
+        self.output_path = output_path
+        self.attach_timeout = attach_timeout
         self.console = Console() if RICH_AVAILABLE else None
         
     def _validate_server(self) -> None:
@@ -50,6 +61,80 @@ class McpClient:
     
     def _send_request(self, method: str, params: Optional[Dict] = None) -> Dict:
         """Send a JSON-RPC request to the MCP server and return the response"""
+        if self.fifo_path:
+            return self._send_request_attached(method, params)
+        return self._send_request_spawned(method, params)
+    
+    def _send_request_attached(self, method: str, params: Optional[Dict] = None) -> Dict:
+        """Send a JSON-RPC request to an already-running MCP server via a FIFO.
+
+        The running server reads requests from ``fifo_path`` (its stdin) and writes
+        responses to ``output_path`` (its stdout). Responses are correlated to the
+        request by the JSON-RPC ``id`` field.
+        """
+        request = {
+            "jsonrpc": "2.0",
+            "id": str(uuid4()),
+            "method": method,
+        }
+        if params:
+            request["params"] = params
+        request_id = request["id"]
+
+        # Write the request to the FIFO. Use O_NONBLOCK so we fail fast (ENXIO)
+        # if no server is currently reading from the FIFO.
+        try:
+            fd = os.open(self.fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as e:
+            if e.errno == errno.ENXIO:
+                raise McpCliError(
+                    f"No reader on FIFO '{self.fifo_path}'. Is the MCP server running and attached to this FIFO?"
+                )
+            raise McpCliError(f"Could not open FIFO '{self.fifo_path}': {e}")
+
+        try:
+            os.write(fd, (json.dumps(request) + "\n").encode())
+        except OSError as e:
+            raise McpCliError(f"Could not write to FIFO '{self.fifo_path}': {e}")
+        finally:
+            os.close(fd)
+
+        # Poll the output log for a response with the matching id.
+        deadline = time.time() + self.attach_timeout
+        last_size = 0
+        while time.time() < deadline:
+            try:
+                with open(self.output_path, "r", errors="replace") as f:
+                    f.seek(last_size)
+                    new_content = f.read()
+                    last_size = f.tell()
+            except FileNotFoundError:
+                new_content = ""
+
+            for line in new_content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    resp = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if resp.get("id") == request_id:
+                    if "error" in resp:
+                        error = resp["error"]
+                        raise McpCliError(
+                            f"Server error ({error.get('code', 'unknown')}): {error.get('message', 'Unknown error')}"
+                        )
+                    return resp
+
+            time.sleep(0.2)
+
+        raise McpCliError(
+            f"Timed out after {self.attach_timeout}s waiting for response from attached server"
+        )
+    
+    def _send_request_spawned(self, method: str, params: Optional[Dict] = None) -> Dict:
+        """Send a JSON-RPC request by spawning a fresh MCP server process"""
         self._validate_server()
         
         request = {
@@ -148,6 +233,28 @@ Examples:
         "--server-path",
         type=str,
         help="Path to the MCP server binary (auto-detected by default)"
+    )
+    parser.add_argument(
+        "--attach",
+        action="store_true",
+        help="Attach to an already-running MCP server instead of spawning a new one. "
+             "Requires --fifo and --output."
+    )
+    parser.add_argument(
+        "--fifo",
+        type=str,
+        help="Path to the FIFO the running server reads requests from (its stdin)"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="Path to the file the running server writes responses to (its stdout)"
+    )
+    parser.add_argument(
+        "--attach-timeout",
+        type=float,
+        default=30.0,
+        help="Timeout in seconds to wait for a response from the attached server (default: 30)"
     )
     
     # Subcommands
@@ -279,9 +386,19 @@ def main():
         sys.exit(1)
     
     try:
-        # Find server binary
-        server_path = args.server_path or find_server_binary()
-        client = McpClient(server_path)
+        # Attach mode: talk to an already-running server via FIFO + output log.
+        if args.attach:
+            if not args.fifo or not args.output:
+                raise McpCliError("--attach requires both --fifo and --output")
+            client = McpClient(
+                fifo_path=args.fifo,
+                output_path=args.output,
+                attach_timeout=args.attach_timeout,
+            )
+        else:
+            # Find server binary
+            server_path = args.server_path or find_server_binary()
+            client = McpClient(server_path)
         
         # Execute the appropriate command
         if args.command == "list-tools":
