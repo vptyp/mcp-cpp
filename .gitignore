@@ -2,3 +2,6 @@
 /target/
 .cache
 *.log
+# Python
+__pycache__/
+*.pyc

@@ -464,7 +464,7 @@ jobs:
             ### 🛠️ CLI Tool
             Use the Python CLI tool for easy interaction:
             ```bash
-            python3 tools/mcp-cli.py --help
+            python3 tools/lsp-cli.py --help
             ```
           draft: false
           prerelease: false

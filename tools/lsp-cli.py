@@ -14,9 +14,16 @@ import subprocess
 import sys
 import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 from uuid import uuid4
+
+# Default per-project cache/config file name. Stores python-side cache vars
+# (transport, http_url, session_id, server_path, ...) so the CLI can auto-connect
+# to a running server without re-passing flags.
+DEFAULT_CONFIG_FILE = ".lsp-cli.json"
 
 try:
     from rich.console import Console
@@ -36,6 +43,11 @@ class McpCliError(Exception):
     pass
 
 
+class _StaleSessionError(McpCliError):
+    """Internal: the cached HTTP session is no longer valid on the server."""
+    pass
+
+
 class McpClient:
     """JSON-RPC client for communicating with the MCP server"""
     
@@ -45,11 +57,15 @@ class McpClient:
         fifo_path: Optional[str] = None,
         output_path: Optional[str] = None,
         attach_timeout: float = 30.0,
+        http_url: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         self.server_path = server_path
         self.fifo_path = fifo_path
         self.output_path = output_path
         self.attach_timeout = attach_timeout
+        self.http_url = http_url
+        self.session_id = session_id
         self.console = Console() if RICH_AVAILABLE else None
         
     def _validate_server(self) -> None:
@@ -61,10 +77,113 @@ class McpClient:
     
     def _send_request(self, method: str, params: Optional[Dict] = None) -> Dict:
         """Send a JSON-RPC request to the MCP server and return the response"""
+        if self.http_url:
+            return self._send_request_http(method, params)
         if self.fifo_path:
             return self._send_request_attached(method, params)
         return self._send_request_spawned(method, params)
-    
+
+    def _http_exchange(self, payload: Dict) -> Dict:
+        """POST a JSON-RPC payload to the streamable-http endpoint and parse the response.
+
+        Handles both plain JSON responses (application/json) and SSE
+        (text/event-stream), capturing the ``Mcp-Session-Id`` header on responses
+        that (re)establish a session.
+        """
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        request = urllib.request.Request(
+            self.http_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.attach_timeout) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                new_session_id = resp.headers.get("Mcp-Session-Id")
+                body = resp.read()
+        except urllib.error.HTTPError as e:
+            # A 404 on the endpoint with a session id means the cached session
+            # is stale (e.g. the server was restarted). Signal a retry.
+            if e.code == 404 and self.session_id:
+                self.session_id = None
+                raise _StaleSessionError("cached session no longer valid")
+            raise McpCliError(f"HTTP request to {self.http_url} failed: {e}")
+        except urllib.error.URLError as e:
+            raise McpCliError(f"HTTP request to {self.http_url} failed: {e}")
+        except OSError as e:
+            raise McpCliError(f"Could not connect to {self.http_url}: {e}")
+
+        if new_session_id:
+            self.session_id = new_session_id
+        text = body.decode("utf-8", errors="replace")
+
+        if "text/event-stream" in content_type:
+            data_line = None
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("data:"):
+                    d = line[5:].strip()
+                    if d and d != "[DONE]":
+                        data_line = d
+            if data_line is None:
+                raise McpCliError("No SSE data received from MCP server")
+            return json.loads(data_line)
+        return json.loads(text)
+
+    def _initialize_http(self) -> None:
+        """Send the MCP `initialize` request to establish an HTTP session."""
+        init = {
+            "jsonrpc": "2.0",
+            "id": str(uuid4()),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "lsp-cli", "version": "1.0"},
+            },
+        }
+        self._http_exchange(init)
+
+    def _send_request_http(self, method: str, params: Optional[Dict] = None) -> Dict:
+        """Send a JSON-RPC request to a running streamable-http MCP server.
+
+        Initializes a session if needed (reusing a cached ``session_id`` when
+        available) and retries once if the session has gone stale.
+        """
+        request = {"jsonrpc": "2.0", "id": str(uuid4()), "method": method}
+        if params:
+            request["params"] = params
+
+        try:
+            if not self.session_id:
+                self._initialize_http()
+            payload = self._http_exchange(request)
+        except _StaleSessionError:
+            # Cached session expired server-side; start a fresh one and retry.
+            self.session_id = None
+            self._initialize_http()
+            payload = self._http_exchange(request)
+
+        if "error" in payload:
+            error = payload["error"]
+            # Some servers report a stale session as a JSON-RPC error instead of
+            # an HTTP 404; retry once with a fresh session.
+            if error.get("code") == -32015:
+                self.session_id = None
+                self._initialize_http()
+                payload = self._http_exchange(request)
+            else:
+                raise McpCliError(
+                    f"Server error ({error.get('code', 'unknown')}): {error.get('message', 'Unknown error')}"
+                )
+        return payload
+
     def _send_request_attached(self, method: str, params: Optional[Dict] = None) -> Dict:
         """Send a JSON-RPC request to an already-running MCP server via a FIFO.
 
@@ -203,6 +322,49 @@ def find_server_binary() -> str:
     raise McpCliError("Could not find mcp-cpp-server binary. Please install it in PATH or specify --server-path")
 
 
+def _find_config_file(explicit: Optional[str] = None) -> Optional[str]:
+    """Locate the .lsp-cli.json cache file.
+
+    Searches upward from the current directory so the CLI auto-discovers the
+    project-root config. An explicit ``--config`` path wins if provided.
+    """
+    if explicit:
+        return explicit
+    d = os.path.abspath(os.getcwd())
+    while True:
+        candidate = os.path.join(d, DEFAULT_CONFIG_FILE)
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return None
+
+
+def _load_config(config_path: Optional[str] = None):
+    """Load the cache/config file, returning ``(cache, resolved_path)``."""
+    path = _find_config_file(config_path)
+    if not path:
+        return {}, None
+    try:
+        with open(path, "r") as f:
+            return json.load(f), path
+    except Exception:
+        return {}, path
+
+
+def _save_config(cache: Dict, path: str) -> None:
+    """Write the cache/config file, ignoring failures (non-fatal)."""
+    if not path:
+        return
+    try:
+        with open(path, "w") as f:
+            json.dump(cache, f, indent=2)
+    except OSError as e:
+        print(f"Warning: could not write config file {path}: {e}", file=sys.stderr)
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser with all subcommands"""
     parser = argparse.ArgumentParser(
@@ -216,6 +378,8 @@ Examples:
   %(prog)s search-method "WebContents::" --max-results 10
   %(prog)s analyze-symbol "Math::sqrt" --max-examples 3
   %(prog)s get-project-details --pretty-json
+  # Connect to a running streamable-http server (also auto-read from .lsp-cli.json)
+  %(prog)s --http-url http://127.0.0.1:8080/mcp search-symbols Math
         """
     )
     
@@ -257,6 +421,17 @@ Examples:
         type=float,
         default=30.0,
         help="Timeout in seconds to wait for a response from the attached server (default: 30)"
+    )
+    parser.add_argument(
+        "--http-url",
+        type=str,
+        help="URL of a running streamable-http MCP server (e.g. http://127.0.0.1:8080/mcp). "
+             "Overrides the cached value in .lsp-cli.json."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help=f"Path to the cache/config file (default: {DEFAULT_CONFIG_FILE} in the project directory)"
     )
     
     # Subcommands
@@ -529,8 +704,20 @@ def main():
         sys.exit(1)
     
     try:
+        # Load python-side cache vars from .lsp-cli.json (if present).
+        config, config_path = _load_config(args.config)
+
+        # Determine the HTTP endpoint: explicit --http-url wins over the cache.
+        http_url = args.http_url or config.get("http_url")
+
+        if http_url:
+            client = McpClient(
+                http_url=http_url,
+                session_id=config.get("session_id"),
+                attach_timeout=args.attach_timeout,
+            )
         # Attach mode: talk to an already-running server via FIFO + output log.
-        if args.attach:
+        elif args.attach:
             if not args.fifo or not args.output:
                 raise McpCliError("--attach requires both --fifo and --output")
             client = McpClient(
@@ -589,7 +776,22 @@ def main():
         
         # Translate numeric symbol kinds to readable names for LLM-friendly output
         _translate_response_kinds(response)
-        
+
+        # On successful HTTP exchange, cache connection vars so the next call
+        # can auto-connect without flags. The file lives in the project root
+        # (current working directory) unless an explicit --config was given.
+        if http_url and getattr(client, "session_id", None):
+            target = args.config or os.path.join(os.getcwd(), DEFAULT_CONFIG_FILE)
+            _save_config(
+                {
+                    "transport": "http",
+                    "http_url": http_url,
+                    "session_id": client.session_id,
+                    "server_path": args.server_path or config.get("server_path"),
+                },
+                target,
+            )
+
         # Output the response
         if args.raw_output:
             print(json.dumps(response, indent=2))

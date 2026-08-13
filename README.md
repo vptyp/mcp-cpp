@@ -226,16 +226,16 @@ cd mcp-cpp
 pip install -r tools/requirements.txt
 
 # Search for symbols (see what the agent would see)
-python3 tools/mcp-cli.py search-symbols "MyClass"
+python3 tools/lsp-cli.py search-symbols "MyClass"
 
 # Get complete API overview of a header file
-python3 tools/mcp-cli.py search-symbols "" --files include/api.h
+python3 tools/lsp-cli.py search-symbols "" --files include/api.h
 
 # Analyze a symbol with examples
-python3 tools/mcp-cli.py analyze-symbol "MyClass::process"
+python3 tools/lsp-cli.py analyze-symbol "MyClass::process"
 
 # Get project overview
-python3 tools/mcp-cli.py get-project-details
+python3 tools/lsp-cli.py get-project-details
 ```
 
 ### Basic Workflow

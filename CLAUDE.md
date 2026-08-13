@@ -36,7 +36,7 @@ This is a **C++ MCP (Model Context Protocol) server** implemented in Rust that b
 - Project vs external symbol filtering using compilation database analysis
 - Structured JSON responses with comprehensive error handling
 - CI/CD pipeline with build, tests, clippy, and security audit
-- **Python CLI Tool (`mcp-cli.py`)** - Standalone command-line interface for easy MCP server interaction
+- **Python CLI Tool (`lsp-cli.py`)** - Standalone command-line interface for easy MCP server interaction
 - **FIXED: Result limiting architecture** - Proper client-side limiting preserving clangd ranking
 
 ### 🔄 Current Architecture
@@ -94,7 +94,7 @@ src/
         └── utils.rs            // Tool utility functions
 
 tools/
-├── mcp-cli.py           // Standalone Python CLI for MCP server interaction
+├── lsp-cli.py           // Standalone Python CLI for MCP server interaction
 ├── requirements.txt     // Python dependencies (rich>=13.0.0)
 ├── generate-index.py    // Symbol indexing tool
 └── clangd-idx-viewer.py // Clangd index debugging utility
@@ -112,7 +112,7 @@ tools/
 8. **Global Compilation Database**: Override support for unified compilation databases across multi-component projects
 9. **Workspace Session Management**: Persistent workspace state with multi-provider project scanning and component tracking
 
-## Python CLI Tool (`mcp-cli.py`)
+## Python CLI Tool (`lsp-cli.py`)
 
 ### **Why This Tool is Valuable**
 
@@ -136,7 +136,7 @@ cd /path/to/cpp/project
 export CLANGD_PATH=/usr/bin/clangd-20
 
 # Use the CLI tool
-python3 /path/to/mcp-cpp/tools/mcp-cli.py [COMMAND] [OPTIONS]
+python3 /path/to/mcp-cpp/tools/lsp-cli.py [COMMAND] [OPTIONS]
 ```
 
 **Available Commands:**
@@ -145,31 +145,31 @@ python3 /path/to/mcp-cpp/tools/mcp-cli.py [COMMAND] [OPTIONS]
 
    ```bash
    # Get comprehensive project details including build configurations and components
-   python3 tools/mcp-cli.py get-project-details
+   python3 tools/lsp-cli.py get-project-details
    ```
 
 2. **Symbol Search:**
 
    ```bash
    # Find symbols quickly
-   python3 tools/mcp-cli.py search-symbols "Math"
-   python3 tools/mcp-cli.py search-symbols "vector" --max-results 20
-   python3 tools/mcp-cli.py search-symbols "std::" --include-external
+   python3 tools/lsp-cli.py search-symbols "Math"
+   python3 tools/lsp-cli.py search-symbols "vector" --max-results 20
+   python3 tools/lsp-cli.py search-symbols "std::" --include-external
    ```
 
 3. **Deep Symbol Analysis:**
 
    ```bash
    # Comprehensive symbol analysis (automatic analysis based on symbol type)
-   python3 tools/mcp-cli.py analyze-symbol "Math::factorial" --max-examples 5
-   python3 tools/mcp-cli.py analyze-symbol "MyClass" --location-hint "/path/file.cpp:42:15"
-   python3 tools/mcp-cli.py analyze-symbol "factorial" --wait-timeout 0 --no-code
+   python3 tools/lsp-cli.py analyze-symbol "Math::factorial" --max-examples 5
+   python3 tools/lsp-cli.py analyze-symbol "MyClass" --location-hint "/path/file.cpp:42:15"
+   python3 tools/lsp-cli.py analyze-symbol "factorial" --wait-timeout 0 --no-code
    ```
 
 4. **Tool Discovery:**
    ```bash
    # See all available MCP tools
-   python3 tools/mcp-cli.py list-tools
+   python3 tools/lsp-cli.py list-tools
    ```
 
 **Output Modes:**
@@ -205,16 +205,16 @@ python3 /path/to/mcp-cpp/tools/mcp-cli.py [COMMAND] [OPTIONS]
 
 ```bash
 # 1. Analyze project structure and build configurations
-python3 tools/mcp-cli.py get-project-details
+python3 tools/lsp-cli.py get-project-details
 
 # 2. Find symbols of interest
-python3 tools/mcp-cli.py search-symbols "Calculator" --kinds class function
+python3 tools/lsp-cli.py search-symbols "Calculator" --kinds class function
 
 # 3. Deep dive into specific symbols
-python3 tools/mcp-cli.py analyze-symbol "Calculator::compute" --include-usage-patterns
+python3 tools/lsp-cli.py analyze-symbol "Calculator::compute" --include-usage-patterns
 
 # 4. Export results for further processing
-python3 tools/mcp-cli.py search-symbols "Math::" --raw-output > math_symbols.json
+python3 tools/lsp-cli.py search-symbols "Math::" --raw-output > math_symbols.json
 ```
 
 This tool essentially **democratizes access** to the powerful MCP server capabilities, making semantic C++ code analysis available through simple command-line operations.
@@ -264,15 +264,15 @@ cargo watch -x run         # Auto-restart server on changes
 
 # Use the Python CLI tool
 cd tools && pip3 install -r requirements.txt  # Install dependencies
-python3 mcp-cli.py --help   # Get help
-python3 mcp-cli.py list-tools
+python3 lsp-cli.py --help   # Get help
+python3 lsp-cli.py list-tools
 ```
 
 ## Repository Structure
 
 - `src/`: Rust source code with modular LSP and tool implementations
 - `tools/`: Utility tools and CLI interfaces
-  - `mcp-cli.py`: **Standalone Python CLI tool for easy MCP server interaction**
+  - `lsp-cli.py`: **Standalone Python CLI tool for easy MCP server interaction**
   - `requirements.txt`: Python dependencies for the CLI tool
   - `generate-index.py`: Symbol indexing tool
 - `test/`: Test projects and fixtures for validation
@@ -770,8 +770,8 @@ cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo t
 cargo build && cd test/e2e && npm test
 
 # CLI tool validation
-python3 tools/mcp-cli.py get-project-details
-python3 tools/mcp-cli.py search-symbols "pattern"
+python3 tools/lsp-cli.py get-project-details
+python3 tools/lsp-cli.py search-symbols "pattern"
 
 # Debug preserved test failures
 cd test/e2e && npm run inspect:verbose
