@@ -21,10 +21,23 @@ use rust_mcp_sdk::schema::{
 use rust_mcp_sdk::{
     McpServer, StdioTransport, TransportOptions,
     error::SdkResult,
-    mcp_server::{McpServerOptions, ToMcpServerHandler, server_runtime},
+    mcp_server::{
+        HyperServerOptions, McpServerOptions, ToMcpServerHandler, hyper_server, server_runtime,
+    },
 };
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
+
+/// Transport to use for the MCP server
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+enum Transport {
+    /// Standard input/output transport (spawned by an MCP client)
+    Stdio,
+    /// Streamable HTTP transport (standalone axum server over TCP)
+    Http,
+}
 
 /// CLI arguments for the MCP C++ server
 #[derive(Parser, Debug)]
@@ -45,6 +58,18 @@ struct Args {
     /// Log file path (overrides MCP_LOG_FILE env var)
     #[arg(long, value_name = "FILE")]
     log_file: Option<PathBuf>,
+
+    /// Transport to serve on: stdio (default) or http (streamable HTTP)
+    #[arg(long, value_name = "TRANSPORT", default_value = "stdio")]
+    transport: Transport,
+
+    /// Host to bind the streamable-http server to (default: 127.0.0.1)
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+
+    /// Port to bind the streamable-http server to (default: 8080)
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
 }
 
 /// Resolve clangd path from CLI args and environment
@@ -144,9 +169,6 @@ async fn main() -> SdkResult<()> {
     let clangd_path = resolve_clangd_path(args.clangd_path);
     info!("Using clangd: {}", clangd_path);
 
-    // Create stdio transport
-    let transport = StdioTransport::new(TransportOptions::default())?;
-
     // Create custom handler with ProjectWorkspace and clangd path
     let handler = match CppServerHandler::new(project_workspace, clangd_path) {
         Ok(handler) => handler,
@@ -156,25 +178,73 @@ async fn main() -> SdkResult<()> {
         }
     };
 
-    // Create MCP server
-    let server = server_runtime::create_server(McpServerOptions {
-        server_details,
-        transport,
-        handler: handler.to_mcp_server_handler(),
-        task_store: None,
-        client_task_store: None,
-    });
+    match args.transport {
+        Transport::Stdio => {
+            // Create stdio transport
+            let transport = StdioTransport::new(TransportOptions::default())?;
 
-    info!("C++ MCP Server ready and listening for requests");
+            // Create MCP server
+            let server = server_runtime::create_server(McpServerOptions {
+                server_details,
+                transport,
+                handler: handler.to_mcp_server_handler(),
+                task_store: None,
+                client_task_store: None,
+            });
 
-    // Start the server
-    if let Err(start_error) = server.start().await {
-        eprintln!(
-            "{}",
-            start_error
-                .rpc_error_message()
-                .unwrap_or(&start_error.to_string())
-        );
+            info!("C++ MCP Server ready and listening for requests (stdio)");
+
+            // Start the server
+            if let Err(start_error) = server.start().await {
+                eprintln!(
+                    "{}",
+                    start_error
+                        .rpc_error_message()
+                        .unwrap_or(&start_error.to_string())
+                );
+            }
+        }
+        Transport::Http => {
+            let host = args.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = args.port.unwrap_or(8080);
+
+            let http_options = HyperServerOptions {
+                host,
+                port,
+                transport_options: Arc::new(TransportOptions::default()),
+                // Return plain JSON instead of SSE streams for simpler clients.
+                enable_json_response: Some(true),
+                // The SDK's single-shot JSON path reads only the first SSE line as
+                // the response. With the default 12s ping interval, a request that
+                // takes longer than 12s (e.g. an LSP query on a large codebase)
+                // would have its first line be a keepalive ping, yielding an empty
+                // body. Raise the interval so the actual response is always first.
+                ping_interval: Duration::from_secs(3600),
+                ..Default::default()
+            };
+            let base_url = http_options.base_url();
+            let endpoint = http_options.streamable_http_url();
+
+            let http_server = hyper_server::create_server(
+                server_details,
+                handler.to_mcp_server_handler(),
+                http_options,
+            );
+
+            info!("C++ MCP Server ready at {} (streamable-http)", endpoint);
+            eprintln!("MCP streamable HTTP server listening at {}", endpoint);
+            eprintln!("  base URL: {}", base_url);
+
+            // Start the server
+            if let Err(start_error) = http_server.start().await {
+                eprintln!(
+                    "{}",
+                    start_error
+                        .rpc_error_message()
+                        .unwrap_or(&start_error.to_string())
+                );
+            }
+        }
     }
 
     Ok(())
