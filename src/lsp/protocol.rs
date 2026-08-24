@@ -130,6 +130,12 @@ pub enum JsonRpcError {
 /// Type alias for notification handler to reduce complexity
 type NotificationHandler = Arc<dyn Fn(JsonRpcNotification) + Send + Sync>;
 
+/// Type alias for a list of notification handlers (fan-out dispatcher).
+///
+/// Multiple handlers can be registered (e.g. the index progress monitor and a
+/// diagnostics collector) and every notification is dispatched to all of them.
+type NotificationHandlers = Vec<NotificationHandler>;
+
 /// Type alias for request handler to reduce complexity
 type RequestHandler = Arc<dyn Fn(JsonRpcRequest) -> JsonRpcResponse + Send + Sync>;
 
@@ -202,8 +208,8 @@ impl JsonRpcMessage {
 /// Unified client state to eliminate cloning and multiple mutexes
 #[derive(Default)]
 struct ClientState {
-    /// Handler for incoming notifications
-    notification_handler: Option<NotificationHandler>,
+    /// Handlers for incoming notifications (all are dispatched to)
+    notification_handlers: NotificationHandlers,
     /// Handler for incoming requests from server
     request_handler: Option<RequestHandler>,
     /// Pending requests waiting for responses
@@ -281,13 +287,16 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
         }
     }
 
-    /// Set notification handler
+    /// Register a notification handler
+    ///
+    /// Multiple handlers may be registered; every notification is fanned out to
+    /// all of them. Existing handlers are preserved.
     pub async fn on_notification<F>(&self, handler: F)
     where
         F: Fn(JsonRpcNotification) + Send + Sync + 'static,
     {
         let mut state = self.state.lock().await;
-        state.notification_handler = Some(Arc::new(handler));
+        state.notification_handlers.push(Arc::new(handler));
     }
 
     /// Set request handler
@@ -348,19 +357,21 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
             JsonRpcMessage::Notification { method, params } => {
                 debug!("Received notification: {}", method);
 
-                // Get notification handler (single lock acquisition)
-                let notification_handler = {
+                // Get notification handlers (single lock acquisition)
+                let notification_handlers = {
                     let state = state.lock().await;
-                    state.notification_handler.clone()
+                    state.notification_handlers.clone()
                 };
 
-                if let Some(handler) = notification_handler {
+                if !notification_handlers.is_empty() {
                     let notification = JsonRpcNotification {
                         jsonrpc: crate::lsp::jsonrpc_utils::JSONRPC_VERSION.to_string(),
                         method,
                         params,
                     };
-                    handler(notification);
+                    for handler in notification_handlers {
+                        handler(notification.clone());
+                    }
                 }
             }
 

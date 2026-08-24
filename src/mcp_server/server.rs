@@ -10,6 +10,7 @@ use super::server_helpers::{self, McpToolHandler};
 use super::tools::analyze_symbols::AnalyzeSymbolContextTool;
 use super::tools::project_tools::GetProjectDetailsTool;
 use super::tools::search_symbols::SearchSymbolsTool;
+use super::tools::show_diagnostics::ShowDiagnosticsTool;
 use crate::project::{ProjectError, ProjectWorkspace, WorkspaceSession};
 use crate::register_tools;
 use crate::{log_mcp_message, log_timing};
@@ -82,10 +83,36 @@ impl McpToolHandler<SearchSymbolsTool> for CppServerHandler {
 
 impl McpToolHandler<AnalyzeSymbolContextTool> for CppServerHandler {
     const TOOL_NAME: &'static str = "analyze_symbol_context";
-
     async fn call_tool_async(
         &self,
         tool: AnalyzeSymbolContextTool,
+    ) -> Result<CallToolResult, CallToolError> {
+        let build_dir = self
+            .resolve_build_directory(tool.build_directory.as_deref())
+            .await?;
+
+        let component_session = self
+            .workspace_session
+            .get_component_session(build_dir)
+            .await
+            .map_err(|e| {
+                CallToolError::new(std::io::Error::other(format!(
+                    "ComponentSession creation failed: {}",
+                    e
+                )))
+            })?;
+
+        let workspace = self.workspace_session.get_workspace().lock().await;
+        tool.call_tool(component_session, &workspace).await
+    }
+}
+
+impl McpToolHandler<ShowDiagnosticsTool> for CppServerHandler {
+    const TOOL_NAME: &'static str = "show_diagnostics";
+
+    async fn call_tool_async(
+        &self,
+        tool: ShowDiagnosticsTool,
     ) -> Result<CallToolResult, CallToolError> {
         let build_dir = self
             .resolve_build_directory(tool.build_directory.as_deref())
@@ -113,6 +140,7 @@ register_tools! {
         GetProjectDetailsTool => call_tool_async (async),
         SearchSymbolsTool => call_tool_async (async),
         AnalyzeSymbolContextTool => call_tool_async (async),
+        ShowDiagnosticsTool => call_tool_async (async),
     }
 }
 

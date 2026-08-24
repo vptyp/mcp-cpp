@@ -378,6 +378,7 @@ Examples:
   %(prog)s search-method "WebContents::" --max-results 10
   %(prog)s analyze-symbol "Math::sqrt" --max-examples 3
   %(prog)s get-project-details --pretty-json
+  %(prog)s show-diagnostics src/main.cpp --build-directory /abs/path/build
   # Connect to a running streamable-http server (also auto-read from .lsp-cli.json)
   %(prog)s --http-url http://127.0.0.1:8080/mcp search-symbols Math
         """
@@ -562,6 +563,26 @@ Examples:
         help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
     )
     
+    # show-diagnostics subcommand
+    diagnostics_parser = subparsers.add_parser(
+        "show-diagnostics",
+        help="Show clangd diagnostics (errors/warnings/notes) for a source file",
+    )
+    diagnostics_parser.add_argument(
+        "file",
+        help="Path to the C++ source file to check (relative paths resolved against the project root)",
+    )
+    diagnostics_parser.add_argument(
+        "--build-directory",
+        type=str,
+        help="Specify build directory path containing compile_commands.json",
+    )
+    diagnostics_parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        help="Timeout in seconds to wait for clangd to publish diagnostics (default: 20, 0 = no wait)",
+    )
+
     # analyze-symbol subcommand
     analyze_parser = subparsers.add_parser(
         "analyze-symbol",
@@ -773,6 +794,14 @@ def main():
             if hasattr(args, 'include_details') and args.include_details:
                 arguments["include_details"] = True
             response = client.call_tool("get_project_details", arguments)
+
+        elif args.command == "show-diagnostics":
+            arguments = {"file": args.file}
+            if args.build_directory:
+                arguments["build_directory"] = args.build_directory
+            if args.wait_timeout is not None:
+                arguments["wait_timeout"] = args.wait_timeout
+            response = client.call_tool("show_diagnostics", arguments)
         
         # Translate numeric symbol kinds to readable names for LLM-friendly output
         _translate_response_kinds(response)
@@ -908,6 +937,8 @@ def _format_rich_output(command: str, response: Dict, show_code: bool = True, sh
             _format_symbol_analysis(console, data, show_code=show_code, show_all_members=show_all_members)
         elif command == "get-project-details":
             _format_project_details(console, data)
+        elif command == "show-diagnostics":
+            _format_diagnostics(console, data)
         else:
             # Fallback to JSON
             syntax = Syntax(json.dumps(data, indent=2), "json", theme="monokai")
@@ -1032,6 +1063,85 @@ def _format_index_status(console, index_status: Dict) -> None:
     panel = Panel(panel_content, title="Indexing Status", border_style=status_color, padding=(0, 1))
     console.print(panel)
     console.print()
+
+
+def _format_diagnostics(console, data: Dict) -> None:
+    """Format show-diagnostics results"""
+    if not data.get("success", False):
+        console.print(f"[red]Diagnostics failed: {data.get('error', 'Unknown error')}[/red]")
+        return
+
+    file = data.get("file", "Unknown")
+    errors = data.get("errors", 0)
+    warnings = data.get("warnings", 0)
+    notes = data.get("notes", 0)
+    timed_out = data.get("timed_out", False)
+    diags = data.get("diagnostics", [])
+
+    title_color = "green" if (errors == 0 and warnings == 0) else ("red" if errors > 0 else "yellow")
+    title = f"Diagnostics for '[bold cyan]{file}[/bold cyan]'"
+    summary = f"[bold]{errors}[/bold] error(s), [bold]{warnings}[/bold] warning(s), [bold]{notes}[/bold] note(s)"
+
+    if timed_out:
+        console.print(Panel(
+            f"{summary}\n[yellow]⚠ clangd did not publish diagnostics within the timeout. "
+            f"Try increasing --wait-timeout or check the build directory.[/yellow]",
+            title=title, border_style="yellow", padding=(0, 1)))
+        return
+
+    if not diags:
+        console.print(Panel(
+            "[green]✓ No diagnostics reported - file appears clean.[/green]\n" + summary,
+            title=title, border_style="green", padding=(0, 1)
+        ))
+        return
+
+    console.print(Panel(summary, title=title, border_style=title_color, padding=(0, 1)))
+
+    _DIAG_SEVERITIES = {1: "ERROR", 2: "WARNING", 3: "INFORMATION", 4: "HINT"}
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Severity", style="cyan", width=12)
+    table.add_column("Location", style="white", width=24)
+    table.add_column("Message", style="white")
+    table.add_column("Source", style="dim", width=12)
+
+    for d in diags:
+        sev_raw = d.get("severity")
+        sev = _DIAG_SEVERITIES.get(sev_raw, str(sev_raw)) if sev_raw is not None else "UNKNOWN"
+        sev_color = {"ERROR": "red", "WARNING": "yellow", "INFORMATION": "blue", "HINT": "magenta"}.get(sev, "white")
+        sev_display = f"[{sev_color}]{sev}[/{sev_color}]"
+
+        # Build location string: line:character (1-based) 
+        rng = d.get("range", {})
+        start = rng.get("start", {})
+        line = (start.get("line", 0) or 0) + 1
+        char = (start.get("character", 0) or 0) + 1
+        loc = f":{line}:{char}"
+        message = d.get("message", "")
+        source = d.get("source") or ""
+
+        table.add_row(sev_display, loc, message, source)
+
+    console.print(table)
+
+    # Optionally show related information
+    for d in diags:
+        related = d.get("related_information")
+        if related:
+            console.print(f"[dim]Related info for '{d.get('message', '')}':[/dim]")
+            for ri in related:
+                rloc = ri.get("location", {})
+                rstart = rloc.get("range", {}).get("start", {})
+                rline = (rstart.get("line", 0) or 0) + 1
+                rmsg = ri.get("message", "")
+                console.print(f"  [dim]at {rloc.get('uri', '')}:{rline}[/dim] {rmsg}")
+
+    # Index status footer
+    index_status = data.get("index_status")
+    if index_status:
+        console.print()
+        _format_index_status(console, index_status)
 
 
 def _format_symbols_search(console, data: Dict) -> None:

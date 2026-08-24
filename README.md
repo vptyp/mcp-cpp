@@ -19,7 +19,7 @@ Advanced indexing monitoring tracks both clangd's index state and logs to ensure
 
 ## Features
 
-The server provides three core analysis tools for C++ development. The `get_project_details` tool performs dynamic CMake and Meson build environment discovery and enables configuration switching. For symbol exploration, `search_symbols` offers C++ symbol search with project boundary detection and intelligent filtering. When deeper analysis is needed, `analyze_symbol_context` provides symbol analysis with inheritance and call hierarchy support.
+The server provides four core analysis tools for C++ development. The `get_project_details` tool performs dynamic CMake and Meson build environment discovery and enables configuration switching. For symbol exploration, `search_symbols` offers C++ symbol search with project boundary detection and intelligent filtering. When deeper analysis is needed, `analyze_symbol_context` provides symbol analysis with inheritance and call hierarchy support. For code health, `show_diagnostics` retrieves clangd's compile errors, warnings, and notes for a specific source file.
 
 The implementation works with both CMake and Meson projects, handling projects with multiple libraries and executables simultaneously. Advanced indexing monitors clangd's index state and logs to ensure complete symbol coverage, while intelligent filtering distinguishes between project code and external dependencies. The server automatically discovers and switches between build configurations, and includes a Python CLI tool for quick symbol exploration.
 
@@ -147,7 +147,8 @@ Claude Code uses a different configuration file location and requires explicit p
     "allow": [
       "mcp__cpp__search_symbols",
       "mcp__cpp__analyze_symbol_context",
-      "mcp__cpp__get_project_details"
+      "mcp__cpp__get_project_details",
+      "mcp__cpp__show_diagnostics"
     ]
   }
 }
@@ -234,6 +235,9 @@ python3 tools/lsp-cli.py search-symbols "" --files include/api.h
 # Analyze a symbol with examples
 python3 tools/lsp-cli.py analyze-symbol "MyClass::process"
 
+# Show clangd diagnostics (errors/warnings) for a source file
+python3 tools/lsp-cli.py show-diagnostics src/main.cpp
+
 # Get project overview
 python3 tools/lsp-cli.py get-project-details
 ```
@@ -307,11 +311,33 @@ python3 tools/lsp-cli.py get-project-details
    }
    ```
 
+4. **Show File Diagnostics**
+
+   ```json
+   {
+     "name": "show_diagnostics",
+     "arguments": { "file": "src/main.cpp" }
+   }
+   ```
+
+   With a custom build directory and timeout:
+
+   ```json
+   {
+     "name": "show_diagnostics",
+     "arguments": {
+       "file": "src/main.cpp",
+       "build_directory": "/path/to/build",
+       "wait_timeout": 30
+     }
+   }
+   ```
+
 ## Use Cases
 
 The server excels at code exploration and navigation, helping you find functions, classes, and variables across large codebases. It can analyze relationships between code components and navigate system libraries and third-party dependencies to understand how different parts of your project interact.
 
-For code analysis and review, the server provides detailed symbol context including usage patterns, inheritance relationships, and call hierarchies. This helps you explore class hierarchies and call patterns, making it easier to understand unfamiliar code or prepare for refactoring by identifying all usages and dependencies.
+For code analysis and review, the server provides detailed symbol context including usage patterns, inheritance relationships, and call hierarchies. This helps you explore class hierarchies and call patterns, making it easier to understand unfamiliar code or prepare for refactoring by identifying all usages and dependencies. It can also surface clangd's compile errors and warnings for a file, helping you catch broken or risky code before it reaches a build.
 
 The server also assists with development workflows by enabling switching between Debug, Release, and custom build configurations. It provides clear separation between project symbols and external library symbols, making navigation through large C++ codebases more efficient. The cross-reference generation helps you find all references, implementations, and related symbols quickly.
 
@@ -381,6 +407,38 @@ analyze_symbol_context {"symbol": "MyClass"}
 # Deep dive into a specific method
 analyze_symbol_context {"symbol": "MyClass::process", "max_examples": 3}
 ```
+
+#### `show_diagnostics`
+
+**Purpose**: Retrieve clangd's semantic diagnostics (compile errors, warnings, notes) for a single source file
+
+**What You Get**:
+
+- **Diagnostics**: Errors, warnings, and info/hint diagnostics with exact source ranges (line/character)
+- **Severity Counts**: Summary of errors, warnings, and notes for quick triage
+- **Clean-File Detection**: Distinguishes a clean file from one clangd hasn't parsed yet
+- **Related Information**: Optional related diagnostics (e.g. notes pointing at the root cause)
+
+**How It Works**: LSP diagnostics are *pushed* by clangd only after a file is opened in the session. The tool opens the target file (triggering a fresh parse), captures the `textDocument/publishDiagnostics` notification, and returns the result.
+
+**Perfect For**:
+
+- Verifying a file compiles cleanly before committing
+- Finding the exact compile errors clangd reports for a broken file
+- Understanding warnings that may indicate subtle bugs or undefined behavior
+
+```bash
+# Check a file for errors/warnings
+show_diagnostics {"file": "src/main.cpp"}
+
+# With an explicit build directory and longer wait
+show_diagnostics {"file": "src/main.cpp", "build_directory": "/path/to/build", "wait_timeout": 30}
+```
+
+**Options**:
+- `file` (required): Path to the C++ source file to analyze (relative paths resolved against the project root)
+- `build_directory` (optional): Build directory containing `compile_commands.json` (auto-detected when only one exists)
+- `wait_timeout` (optional): Seconds to wait for clangd to publish diagnostics (default: 20, 0 = no wait)
 
 ## Limitations
 

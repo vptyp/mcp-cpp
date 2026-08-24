@@ -11,11 +11,13 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::clangd::config::DEFAULT_WORKSPACE_SYMBOL_LIMIT;
+use crate::clangd::diagnostics::DiagnosticsCollector;
 use crate::clangd::file_manager::ClangdFileManager;
 use crate::clangd::session::ClangdSessionTrait;
 use crate::clangd::version::ClangdVersion;
 use crate::clangd::{ClangdConfigBuilder, ClangdSession, ClangdSessionBuilder};
 use crate::io::file_system::RealFileSystem;
+use crate::lsp::traits::LspClientTrait;
 #[cfg(all(test, feature = "clangd-integration-tests"))]
 use crate::project::index::ComponentIndexState;
 use crate::project::index::reader::{IndexReader, IndexReaderTrait};
@@ -25,6 +27,7 @@ use crate::project::index::{
     ClangdIndexTrigger, ComponentIndexMonitor, ComponentIndexingState, IndexStatusView,
 };
 use crate::project::{CompilationDatabase, ProjectComponent, ProjectError};
+use lsp_types::Diagnostic;
 
 /// Channel buffer size for progress event processing
 const PROGRESS_CHANNEL_BUFFER_SIZE: usize = 10_000;
@@ -46,6 +49,8 @@ pub struct ComponentSession {
     /// Component metadata
     #[allow(dead_code)]
     component: ProjectComponent,
+    /// Shared collector for clangd-published diagnostics
+    diagnostics_collector: Arc<DiagnosticsCollector>,
 }
 
 impl ComponentSession {
@@ -114,6 +119,18 @@ impl ComponentSession {
         // Wrap in Arc<Mutex> for sharing with background tasks
         let clangd_session = Arc::new(tokio::sync::Mutex::new(session));
 
+        // Create the diagnostics collector and register its handler on the LSP
+        // client so that `textDocument/publishDiagnostics` notifications are
+        // captured for on-demand retrieval.
+        let diagnostics_collector = Arc::new(DiagnosticsCollector::new());
+        {
+            let session_guard = clangd_session.lock().await;
+            session_guard
+                .client()
+                .register_notification_handler(diagnostics_collector.create_handler())
+                .await;
+        }
+
         // Create file manager for this component
         let file_manager = Arc::new(tokio::sync::Mutex::new(ClangdFileManager::new()));
 
@@ -146,6 +163,7 @@ impl ComponentSession {
             file_manager,
             index_monitor,
             component,
+            diagnostics_collector,
         })
     }
 
@@ -229,6 +247,34 @@ impl ComponentSession {
     /// first if you need to open files, then call `.client_mut()` on the returned guard.
     pub async fn lsp_session(&self) -> tokio::sync::MutexGuard<'_, ClangdSession> {
         self.clangd_session.lock().await
+    }
+
+    /// Collect fresh clangd diagnostics for a file.
+    ///
+    /// Diagnostics are pushed asynchronously by clangd only after a file is opened
+    /// in the LSP session. This method:
+    /// 1. Clears any cached diagnostics for the target file.
+    /// 2. Ensures the file is open (opening or re-syncing it triggers a fresh publish).
+    /// 3. Waits up to `timeout` for the published diagnostics.
+    ///
+    /// Returns the published diagnostics (possibly empty if the file is clean) or
+    /// `Ok(None)` if clangd did not publish diagnostics within the timeout.
+    pub async fn get_file_diagnostics(
+        &self,
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<Option<Vec<Diagnostic>>, ProjectError> {
+        let uri = crate::symbol::uri_from_pathbuf(path);
+
+        // Reset so the next publish for this file is treated as fresh.
+        self.diagnostics_collector.reset_for_uri(&uri).await;
+
+        // Open (or refresh) the file, which triggers clangd to publish diagnostics.
+        self.ensure_file_ready(path).await?;
+
+        let diagnostics = self.diagnostics_collector.wait_for_uri(&uri, timeout).await;
+
+        Ok(diagnostics)
     }
 
     /// Get the build directory for this component

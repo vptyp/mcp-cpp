@@ -7,6 +7,7 @@ pub mod analyze_symbols;
 pub mod lsp_helpers;
 pub mod project_tools;
 pub mod search_symbols;
+pub mod show_diagnostics;
 pub mod utils;
 
 #[cfg(feature = "clangd-integration-tests")]

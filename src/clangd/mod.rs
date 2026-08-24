@@ -34,6 +34,7 @@
 //! ```
 
 pub mod config;
+pub mod diagnostics;
 pub mod error;
 pub mod file_manager;
 pub mod index;
