@@ -2,7 +2,7 @@
 
 use rust_mcp_sdk::schema::{CallToolResult, schema_utils::CallToolError};
 use serde::de::DeserializeOwned;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::project::ProjectWorkspace;
@@ -104,6 +104,32 @@ pub fn resolve_build_directory(
 
             match build_dirs.len() {
                 0 => {
+                    // No build dirs discovered by the scan (e.g. GN/ninja projects
+                    // like Chromium that only export compile_commands.json). Default
+                    // to the project root's compile_commands.json when present
+                    // (Chromium's src/compile_commands.json -> out/chrome/... symlink),
+                    // resolving the symlink to find the real build directory.
+                    let root_cdb = workspace.project_root_path.join("compile_commands.json");
+                    if root_cdb.exists()
+                        && let Ok(real) = std::fs::canonicalize(&root_cdb)
+                        && let Some(parent) = real.parent()
+                    {
+                        debug!(
+                            "Defaulting to build dir from project-root compile_commands.json: {:?}",
+                            parent
+                        );
+                        return Ok(parent.to_path_buf());
+                    }
+                    // Fallback: first compile_commands.json under the project root.
+                    if let Some(build_dir) =
+                        find_first_compile_commands_dir(&workspace.project_root_path)
+                    {
+                        debug!(
+                            "Defaulting to first discovered compile_commands.json dir: {:?}",
+                            build_dir
+                        );
+                        return Ok(build_dir);
+                    }
                     debug!("No build directories found in workspace");
                     Err(CallToolError::new(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
@@ -131,6 +157,35 @@ pub fn resolve_build_directory(
             }
         }
     }
+}
+
+/// Find the first directory under `root` (bounded depth) that contains a
+/// `compile_commands.json`, returning that directory. Used as a fallback for
+/// build systems (GN, Bazel, ...) that export a compilation database but are
+/// not discovered by the CMake/Meson providers.
+fn find_first_compile_commands_dir(root: &Path) -> Option<PathBuf> {
+    const MAX_DEPTH: usize = 3;
+
+    fn walk(dir: &Path, depth: usize) -> Option<PathBuf> {
+        if dir.join("compile_commands.json").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if depth >= MAX_DEPTH {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && let Some(found) = walk(&path, depth + 1)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    walk(root, 0)
 }
 
 /// Extension trait for cleaner tool argument deserialization
