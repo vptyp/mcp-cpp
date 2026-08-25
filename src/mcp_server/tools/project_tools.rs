@@ -5,6 +5,7 @@ use rust_mcp_sdk::schema::{CallToolResult, TextContent, schema_utils::CallToolEr
 use tracing::{info, instrument};
 
 use super::utils::serialize_result;
+use crate::config::AppConfig;
 use crate::project::ProjectWorkspace;
 
 #[mcp_tool(
@@ -65,6 +66,12 @@ use crate::project::ProjectWorkspace;
                    • depth (optional): Scan depth for component discovery (0-10 levels) - only specify if different from cached scan
                    • include_details (optional): Include detailed build options (default: false)
 
+                   ⚙️ EFFECTIVE CONFIGURATION:
+                   • The `configuration` block reports the settings the server actually resolved
+                     (clangd path and arguments, timeouts, scan depth, HTTP bind address) and the
+                     `.mcp-cpp.yaml` file they came from, or null when none was found.
+                   • Use it to confirm a config file was picked up before debugging clangd behaviour
+
                    OUTPUT MODES:
                    • Short view (default): Essential info + build_options_count to prevent context exhaustion
                    • Detailed view (include_details=true): All build options for debugging/analysis
@@ -120,6 +127,7 @@ impl GetProjectDetailsTool {
     pub fn call_tool(
         &self,
         meta_project: &ProjectWorkspace,
+        app_config: &AppConfig,
     ) -> Result<CallToolResult, CallToolError> {
         // Determine if we need to re-scan based on different parameters
         let requested_path = self.path.as_ref().map(std::path::PathBuf::from);
@@ -142,7 +150,7 @@ impl GetProjectDetailsTool {
                 requested_depth
             );
 
-            Some(self.perform_fresh_scan(scan_root, requested_depth)?)
+            Some(self.perform_fresh_scan(scan_root, requested_depth, app_config)?)
         } else {
             // Use cached ProjectWorkspace
             info!("Using cached ProjectWorkspace scan results");
@@ -173,6 +181,10 @@ impl GetProjectDetailsTool {
                 "rescanned".to_string(),
                 serde_json::Value::Bool(rescanned_fresh),
             );
+            // Report the settings the server actually resolved, not the file as
+            // written: an agent debugging clangd behaviour needs to see the value
+            // that won, and whether a config file was found at all.
+            obj.insert("configuration".to_string(), config_view(app_config));
         }
 
         info!(
@@ -192,19 +204,57 @@ impl GetProjectDetailsTool {
         &self,
         scan_root: &std::path::Path,
         depth: usize,
+        app_config: &AppConfig,
     ) -> Result<crate::project::ProjectWorkspace, CallToolError> {
         use crate::project::ProjectScanner;
 
         // Create project scanner with default providers
         let scanner = ProjectScanner::with_default_providers();
 
-        // Perform the scan
-        scanner.scan_project(scan_root, depth, None).map_err(|e| {
-            CallToolError::new(std::io::Error::other(format!(
-                "Failed to scan project at {}: {}",
-                scan_root.display(),
-                e
-            )))
-        })
+        // Only the depth is overridden by the caller; the remaining scan rules
+        // (hidden dirs, symlinks, component cap) stay as the project configured
+        // them, so a rescan cannot see a different tree than the startup scan.
+        scanner
+            .scan_project(scan_root, depth, Some(app_config.scan_options()))
+            .map_err(|e| {
+                CallToolError::new(std::io::Error::other(format!(
+                    "Failed to scan project at {}: {}",
+                    scan_root.display(),
+                    e
+                )))
+            })
     }
+}
+
+/// Render the resolved configuration for the tool response.
+///
+/// Deliberately reports effective values rather than echoing the YAML: the
+/// whole point is to answer "what is the server actually using", which after
+/// CLI and environment overrides is not necessarily what the file says.
+fn config_view(config: &AppConfig) -> serde_json::Value {
+    let clangd = &config.clangd;
+    serde_json::json!({
+        "source_file": config.source_file.as_ref().map(|p| p.display().to_string()),
+        "clangd": {
+            "path": clangd.path,
+            "extra_args": clangd.extra_args,
+            "background_index": clangd.background_index,
+            "pch_storage": format!("{:?}", clangd.pch_storage).to_lowercase(),
+            "index_threads": clangd.index_threads,
+            "workspace_symbol_limit": clangd.workspace_symbol_limit,
+            "initialization_timeout_secs": clangd.initialization_timeout.as_secs(),
+            "request_timeout_secs": clangd.request_timeout.as_secs(),
+            "index_wait_timeout_secs": clangd.index_wait_timeout.as_secs(),
+        },
+        "project": {
+            "scan_depth": config.project.scan_depth,
+            "skip_hidden": config.project.skip_hidden,
+            "follow_symlinks": config.project.follow_symlinks,
+            "max_components": config.project.max_components,
+        },
+        "server": {
+            "host": config.server.host,
+            "port": config.server.port,
+        },
+    })
 }

@@ -4,14 +4,14 @@
 //! that reads clangd index files from the local filesystem using dependency injection.
 
 use super::{IndexData, IndexError, IndexMetadata, IndexStorage};
-use crate::clangd::index::hash::compute_file_hash;
 use crate::clangd::index::idx_parser::{IdxParseError, IdxParser};
 use crate::io::file_system::FileSystemTrait;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 /// How long a directory listing is reused before being refreshed.
 ///
@@ -25,8 +25,18 @@ const LISTING_CACHE_TTL: Duration = Duration::from_secs(1);
 pub struct FilesystemIndexStorage<F: FileSystemTrait> {
     /// Root directory containing index files
     index_directory: PathBuf,
-    /// Expected index format version
-    expected_version: u32,
+    /// Index format version guessed from the clangd version string.
+    ///
+    /// Only a starting point: the format version moves independently of the
+    /// clangd release number, so this guess is superseded by `observed_version`
+    /// as soon as a real index file has been read.
+    seeded_version: u32,
+    /// Format version latched from the first index file we managed to parse.
+    ///
+    /// Zero means nothing has been observed yet. Once set it never changes, so
+    /// index files that disagree with it are genuinely stale leftovers from an
+    /// older clangd rather than victims of a bad guess.
+    observed_version: AtomicU32,
     /// Filesystem implementation for dependency injection
     filesystem: F,
     /// Cache of the last successful directory listing (with timestamp)
@@ -38,23 +48,35 @@ impl<F: FileSystemTrait + 'static> FilesystemIndexStorage<F> {
     ///
     /// # Arguments
     /// * `index_directory` - Directory containing clangd index files
-    /// * `expected_version` - Expected index format version
+    /// * `seeded_version` - Index format version guessed from the clangd version
+    ///   string, used only until a real index file has been parsed
     /// * `filesystem` - Filesystem implementation for testability
-    pub fn new(index_directory: PathBuf, expected_version: u32, filesystem: F) -> Self {
+    pub fn new(index_directory: PathBuf, seeded_version: u32, filesystem: F) -> Self {
         Self {
             index_directory,
-            expected_version,
+            seeded_version,
+            observed_version: AtomicU32::new(0),
             filesystem,
             listing_cache: Mutex::new(None),
         }
     }
 
-    /// Get the path to an index file for a given source file
-    fn get_index_file_path(&self, source_path: &Path) -> PathBuf {
-        let path_str = source_path.to_string_lossy();
-        let hash = compute_file_hash(&path_str, self.expected_version);
-        let index_filename = format!("{:016X}.idx", hash);
-        self.index_directory.join(index_filename)
+    /// Record the format version clangd actually wrote.
+    ///
+    /// The first observation wins; later files are compared against it rather
+    /// than replacing it.
+    fn observe_version(&self, version: u32) {
+        if self
+            .observed_version
+            .compare_exchange(0, version, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+            && version != self.seeded_version
+        {
+            info!(
+                "clangd index format version is {} (guessed {} from the clangd version string)",
+                version, self.seeded_version
+            );
+        }
     }
 
     /// Parse an index file and extract metadata
@@ -107,10 +129,14 @@ impl<F: FileSystemTrait + 'static> FilesystemIndexStorage<F> {
         // Parse the index file using the IDX parser
         let parsed_data = IdxParser::parse(&file_data).map_err(|e| match e {
             IdxParseError::UnsupportedVersion(v) => {
-                IndexError::incompatible_version(v, self.expected_version)
+                IndexError::incompatible_version(v, self.expected_version())
             }
             _ => IndexError::parse_error(e.to_string()),
         })?;
+
+        // The file just told us what version clangd is really writing; that
+        // beats anything derived from the clangd version string.
+        self.observe_version(parsed_data.format_version);
 
         // Extract source file information from the include graph
         // Look for translation units first, then fall back to any file if no TUs found
@@ -301,11 +327,15 @@ impl<F: FileSystemTrait + 'static> IndexStorage for FilesystemIndexStorage<F> {
 
     fn supports_version(&self, version: u32) -> bool {
         // Support current version and one version back for compatibility
-        version == self.expected_version || version == self.expected_version.saturating_sub(1)
+        let expected = self.expected_version();
+        version == expected || version == expected.saturating_sub(1)
     }
 
     fn expected_version(&self) -> u32 {
-        self.expected_version
+        match self.observed_version.load(Ordering::Relaxed) {
+            0 => self.seeded_version,
+            observed => observed,
+        }
     }
 }
 
@@ -329,17 +359,26 @@ mod tests {
     }
 
     #[test]
-    fn test_index_file_path_generation() {
+    fn test_observed_version_supersedes_seeded_guess() {
         let temp_dir = TempDir::new().unwrap();
         let filesystem = TestFileSystem::new();
         let storage = FilesystemIndexStorage::new(temp_dir.path().to_path_buf(), 19, filesystem);
 
-        let source_path = Path::new("/project/src/main.cpp");
-        let index_path = storage.get_index_file_path(source_path);
+        // The clangd-version-string guess stands only until a file contradicts it.
+        assert_eq!(storage.expected_version(), 19);
 
-        // Should generate consistent hash-based filename
-        assert!(index_path.starts_with(temp_dir.path()));
-        assert!(index_path.to_string_lossy().contains(".idx"));
+        storage.observe_version(20);
+        assert_eq!(storage.expected_version(), 20);
+        assert!(storage.supports_version(20));
+        assert!(
+            !storage.supports_version(18),
+            "two versions back is genuinely stale"
+        );
+
+        // First observation wins, so one stale leftover cannot redefine what the
+        // workspace considers current.
+        storage.observe_version(17);
+        assert_eq!(storage.expected_version(), 20);
     }
 
     #[tokio::test]

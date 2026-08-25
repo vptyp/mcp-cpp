@@ -182,7 +182,8 @@ impl IndexReader {
         // Step 1: Check format version compatibility
         if index_data.format_version != self.storage.expected_version() {
             let reason = format!(
-                "Index version {} incompatible with clangd version (expects {})",
+                "Index format version {} does not match the version clangd is \
+                 currently writing ({}); stale index left over from another clangd",
                 index_data.format_version,
                 self.storage.expected_version()
             );

@@ -107,7 +107,20 @@ impl ClangdVersion {
         })
     }
 
-    /// Get the format version for index files based on clangd version
+    /// Best guess at the index format version this clangd writes.
+    ///
+    /// This is a *guess*, not a fact. The index format version moves
+    /// independently of the clangd release number -- clangd 20, 21 and 22 all
+    /// write format version 20 -- so the table below is only a record of what
+    /// past releases happened to ship with, and the fallback arm cannot do
+    /// better than "the newest format we have seen".
+    ///
+    /// Deliberately *not* an identity fallback (`n => n`): mapping clangd 22 to
+    /// format 22 would be wrong by two, which is outside every compatibility
+    /// window downstream and would invalidate an entire workspace.
+    ///
+    /// Treat the result as a seed only. `FilesystemIndexStorage` replaces it
+    /// with the version read out of a real index file as soon as it has one.
     pub fn index_format_version(&self) -> u32 {
         match self.major {
             10 => 12,
@@ -117,7 +130,7 @@ impl ClangdVersion {
             16 | 17 => 18,
             18 | 19 => 19,
             20 => 20,
-            _ => 20, // Default to latest known version
+            _ => 20, // Newest format we have actually seen shipped
         }
     }
 }

@@ -21,8 +21,14 @@ async fn create_test_component_session() -> (TestProject, Arc<ComponentSession>)
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Ensure indexing completion using ComponentSession
     let component_session = workspace_session

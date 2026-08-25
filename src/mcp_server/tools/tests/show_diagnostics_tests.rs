@@ -24,8 +24,14 @@ async fn test_show_diagnostics_returns_published_diagnostics() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Get a ComponentSession for the build directory
     let component_session = workspace_session
@@ -74,8 +80,14 @@ async fn test_show_diagnostics_short_timeout_returns_ok() {
         .expect("Failed to scan test project");
 
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     let component_session = workspace_session
         .get_component_session(test_project.build_dir.clone())

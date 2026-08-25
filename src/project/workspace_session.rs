@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::clangd::version::ClangdVersion;
+use crate::config::AppConfig;
 use crate::project::compilation_database::CompilationDatabase;
 use crate::project::component::ProjectComponent;
 use crate::project::component_session::ComponentSession;
@@ -32,8 +33,8 @@ pub struct WorkspaceSession {
     /// requests await the same slot so they share one session/clangd instead of
     /// spawning duplicates.
     session_creation: Arc<Mutex<HashMap<PathBuf, Arc<CreationSlot>>>>,
-    /// Path to clangd executable
-    clangd_path: String,
+    /// Resolved application configuration (clangd settings, scan settings, ...)
+    config: Arc<AppConfig>,
     /// Clangd version information
     clangd_version: ClangdVersion,
     /// Project scanner for dynamic component discovery
@@ -76,11 +77,12 @@ impl CreationSlot {
 
 impl WorkspaceSession {
     /// Create a new WorkspaceSession for the given project workspace
-    pub fn new(workspace: ProjectWorkspace, clangd_path: String) -> Result<Self, ProjectError> {
+    pub fn new(workspace: ProjectWorkspace, config: Arc<AppConfig>) -> Result<Self, ProjectError> {
         // Detect clangd version for index format compatibility
-        let clangd_version = ClangdVersion::detect(Path::new(&clangd_path)).map_err(|e| {
-            ProjectError::SessionCreation(format!("Failed to detect clangd version: {}", e))
-        })?;
+        let clangd_version =
+            ClangdVersion::detect(Path::new(&config.clangd.path)).map_err(|e| {
+                ProjectError::SessionCreation(format!("Failed to detect clangd version: {}", e))
+            })?;
 
         info!(
             "Detected clangd version: {}.{}.{}",
@@ -94,7 +96,7 @@ impl WorkspaceSession {
             workspace: Arc::new(Mutex::new(workspace)),
             component_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_creation: Arc::new(Mutex::new(HashMap::new())),
-            clangd_path,
+            config,
             clangd_version,
             scanner,
         })
@@ -252,13 +254,9 @@ impl WorkspaceSession {
             }
         };
 
-        let component_session = ComponentSession::new(
-            component,
-            &self.clangd_path,
-            &self.clangd_version,
-            project_root,
-        )
-        .await?;
+        let component_session =
+            ComponentSession::new(component, &self.config, &self.clangd_version, project_root)
+                .await?;
 
         let component_session_arc = Arc::new(component_session);
 
@@ -281,6 +279,11 @@ impl WorkspaceSession {
     /// the mutex to access workspace data.
     pub fn get_workspace(&self) -> &Arc<Mutex<ProjectWorkspace>> {
         &self.workspace
+    }
+
+    /// The resolved application configuration backing this session
+    pub fn config(&self) -> &Arc<AppConfig> {
+        &self.config
     }
 }
 
@@ -366,7 +369,8 @@ mod tests {
 
         // Create workspace session with empty workspace
         let clangd_path = crate::test_utils::get_test_clangd_path();
-        let workspace_session = WorkspaceSession::new(empty_workspace, clangd_path).unwrap();
+        let config = Arc::new(AppConfig::for_test(Path::new("."), clangd_path));
+        let workspace_session = WorkspaceSession::new(empty_workspace, config).unwrap();
 
         // Request component session for build directory not in workspace
         // This should trigger dynamic discovery
@@ -411,7 +415,8 @@ mod tests {
         let empty_workspace = ProjectWorkspace::new(temp_dir.path().to_path_buf(), vec![], 0);
 
         let clangd_path = crate::test_utils::get_test_clangd_path();
-        let workspace_session = WorkspaceSession::new(empty_workspace, clangd_path).unwrap();
+        let config = Arc::new(AppConfig::for_test(Path::new("."), clangd_path));
+        let workspace_session = WorkspaceSession::new(empty_workspace, config).unwrap();
 
         // Request session for non-existent/invalid build directory
         let invalid_dir = temp_dir.path().join("not_a_build_dir");
@@ -446,7 +451,8 @@ mod tests {
 
         // Create workspace session with pre-populated workspace
         let clangd_path = crate::test_utils::get_test_clangd_path();
-        let workspace_session = WorkspaceSession::new(workspace, clangd_path).unwrap();
+        let config = Arc::new(AppConfig::for_test(Path::new("."), clangd_path));
+        let workspace_session = WorkspaceSession::new(workspace, config).unwrap();
 
         // Request component session - should use existing component, not rediscover
         let component_session = workspace_session

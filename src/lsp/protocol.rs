@@ -227,13 +227,23 @@ pub struct JsonRpcClient<T: Transport> {
     /// Unified client state (single mutex instead of multiple)
     state: Arc<Mutex<ClientState>>,
 
+    /// Timeout applied to [`request`](Self::request).
+    ///
+    /// Supplied by the caller rather than defaulted here, so the configured
+    /// value cannot be silently ignored the way a hardcoded default was.
+    default_request_timeout: std::time::Duration,
+
     /// Type parameter marker
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: Transport + 'static> JsonRpcClient<T> {
     /// Create a new JSON-RPC client
-    pub fn new(transport: T) -> Self {
+    ///
+    /// `default_request_timeout` applies to every [`request`](Self::request);
+    /// individual calls can override it with
+    /// [`request_with_timeout`](Self::request_with_timeout).
+    pub fn new(transport: T, default_request_timeout: std::time::Duration) -> Self {
         let framed_transport = LspFraming::new(transport);
         let transport_arc = Arc::new(Mutex::new(framed_transport));
         let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<String>();
@@ -283,6 +293,7 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
             outbound_sender,
             request_id: AtomicU64::new(1),
             state,
+            default_request_timeout,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -403,7 +414,7 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
         }
     }
 
-    /// Send a JSON-RPC request with default timeout (30 seconds)
+    /// Send a JSON-RPC request using the client's configured default timeout
     pub async fn request<P, R>(
         &mut self,
         method: &str,
@@ -413,7 +424,7 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
         P: serde::Serialize,
         R: for<'de> serde::Deserialize<'de>,
     {
-        self.request_with_timeout(method, params, std::time::Duration::from_secs(30))
+        self.request_with_timeout(method, params, self.default_request_timeout)
             .await
     }
 
@@ -547,5 +558,58 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
         // The transport handler will exit when the channel is closed
         // (which happens when this struct is dropped)
         Ok(())
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::transport::MockTransport;
+    use std::time::Duration;
+
+    /// The configured timeout must actually bound a request.
+    ///
+    /// This previously did not hold: `request` ignored every configured value and
+    /// used a hardcoded 30 seconds, so `LspConfig::request_timeout` was dead. A
+    /// short timeout here would have taken 30s to fail, not ~50ms.
+    #[tokio::test]
+    async fn test_request_honors_configured_timeout() {
+        // MockTransport never produces a response, so the request can only end in
+        // a timeout -- and it must be the one we configured.
+        let mut client = JsonRpcClient::new(MockTransport::new(), Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let result: Result<serde_json::Value, _> = client
+            .request("workspace/symbol", Some(serde_json::json!({})))
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Err(JsonRpcError::Timeout)));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "request took {elapsed:?}; the configured 50ms timeout was ignored"
+        );
+    }
+
+    /// A per-call timeout still overrides the client default.
+    #[tokio::test]
+    async fn test_request_with_timeout_overrides_default() {
+        let mut client = JsonRpcClient::new(MockTransport::new(), Duration::from_secs(600));
+
+        let started = std::time::Instant::now();
+        let result: Result<serde_json::Value, _> = client
+            .request_with_timeout(
+                "workspace/symbol",
+                Some(serde_json::json!({})),
+                Duration::from_millis(50),
+            )
+            .await;
+
+        assert!(matches!(result, Err(JsonRpcError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

@@ -10,12 +10,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 
-use crate::clangd::config::DEFAULT_WORKSPACE_SYMBOL_LIMIT;
 use crate::clangd::diagnostics::DiagnosticsCollector;
 use crate::clangd::file_manager::ClangdFileManager;
 use crate::clangd::session::ClangdSessionTrait;
 use crate::clangd::version::ClangdVersion;
 use crate::clangd::{ClangdConfigBuilder, ClangdSession, ClangdSessionBuilder};
+use crate::config::AppConfig;
 use crate::io::file_system::RealFileSystem;
 use crate::lsp::traits::LspClientTrait;
 #[cfg(all(test, feature = "clangd-integration-tests"))]
@@ -25,6 +25,7 @@ use crate::project::index::storage::IndexStorage;
 use crate::project::index::storage::filesystem::FilesystemIndexStorage;
 use crate::project::index::{
     ClangdIndexTrigger, ComponentIndexMonitor, ComponentIndexingState, IndexStatusView,
+    InitialScanState,
 };
 use crate::project::{CompilationDatabase, ProjectComponent, ProjectError};
 use lsp_types::Diagnostic;
@@ -51,6 +52,11 @@ pub struct ComponentSession {
     component: ProjectComponent,
     /// Shared collector for clangd-published diagnostics
     diagnostics_collector: Arc<DiagnosticsCollector>,
+    /// Default bound on how long a tool waits for indexing to finish.
+    ///
+    /// Kept on the session so tools can honour the project's configured value
+    /// without every tool having to reach for the application config itself.
+    index_wait_timeout: Duration,
 }
 
 impl ComponentSession {
@@ -58,7 +64,7 @@ impl ComponentSession {
     ///
     /// # Arguments
     /// * `component` - The project component this session represents
-    /// * `clangd_path` - Path to the clangd executable
+    /// * `app_config` - Resolved application configuration (clangd settings)
     /// * `clangd_version` - Detected clangd version information
     /// * `project_root` - Project root directory for clangd working directory
     ///
@@ -68,7 +74,7 @@ impl ComponentSession {
     #[instrument(name = "component_session_new", skip(component, clangd_version))]
     pub async fn new(
         component: ProjectComponent,
-        clangd_path: &str,
+        app_config: &AppConfig,
         clangd_version: &ClangdVersion,
         project_root: PathBuf,
     ) -> Result<Self, ProjectError> {
@@ -89,18 +95,36 @@ impl ComponentSession {
         })?;
         let compilation_database = Arc::new(compilation_database);
 
-        // Build configuration using builder pattern
-        let config = ClangdConfigBuilder::new()
+        // Build configuration using builder pattern. Everything tunable comes from
+        // the resolved AppConfig so a project's .mcp-cpp.yaml reaches clangd; only
+        // the per-component paths are decided here.
+        let clangd = &app_config.clangd;
+        let mut builder = ClangdConfigBuilder::new()
             .working_directory(project_root)
             .build_directory(component.build_dir_path.clone())
-            .clangd_path(clangd_path.to_string())
-            .add_arg(format!(
-                "--limit-results={}",
-                DEFAULT_WORKSPACE_SYMBOL_LIMIT
-            ))
-            .add_arg("--log=verbose")
+            .clangd_path(clangd.path.clone())
+            .background_indexing(clangd.background_index)
+            .pch_storage(clangd.pch_storage)
+            .workspace_symbol_limit(clangd.workspace_symbol_limit)
+            .initialization_timeout(clangd.initialization_timeout)
+            .request_timeout(clangd.request_timeout)
+            .add_arg("--log=verbose");
+
+        if let Some(threads) = clangd.index_threads {
+            builder = builder.index_threads(threads);
+        }
+        // User-supplied args go last so they win over anything above, matching the
+        // "the file is the operator's escape hatch" contract.
+        builder = builder.add_args(clangd.extra_args.clone());
+
+        let config = builder
             .build()
             .map_err(|e| ProjectError::SessionCreation(format!("Failed to build config: {}", e)))?;
+
+        // Ask the config where clangd will actually put its index, before the config
+        // is moved into the session builder. Deriving this from the build dir here
+        // would disagree with `--compile-commands-dir` in the root-database layout.
+        let index_directory = config.index_directory();
 
         // Initialize progress event channel for index state tracking
         let (progress_tx, mut progress_rx) = mpsc::channel(PROGRESS_CHANNEL_BUFFER_SIZE);
@@ -136,6 +160,7 @@ impl ComponentSession {
         // Create ComponentIndexMonitor for this component
         let index_monitor = Self::create_index_monitor(
             &component,
+            index_directory,
             compilation_database.clone(),
             clangd_version,
             Arc::clone(&clangd_session),
@@ -163,12 +188,14 @@ impl ComponentSession {
             index_monitor,
             component,
             diagnostics_collector,
+            index_wait_timeout: app_config.clangd.index_wait_timeout,
         })
     }
 
     /// Create a ComponentIndexMonitor for the component
     async fn create_index_monitor(
         component: &ProjectComponent,
+        index_directory: PathBuf,
         compilation_database: Arc<CompilationDatabase>,
         clangd_version: &ClangdVersion,
         session: Arc<tokio::sync::Mutex<ClangdSession>>,
@@ -176,8 +203,9 @@ impl ComponentSession {
     ) -> Result<Arc<ComponentIndexMonitor>, ProjectError> {
         let build_dir = &component.build_dir_path;
 
-        // Create index reader with filesystem storage
-        let index_directory = build_dir.join(".cache/clangd/index");
+        // Create index reader with filesystem storage. `index_directory` comes from
+        // ClangdConfig so it always matches the directory clangd was pointed at.
+        let index_dir_for_monitor = index_directory.clone();
 
         // Use the centralized version mapping from ClangdVersion
         let expected_version = clangd_version.index_format_version();
@@ -199,6 +227,7 @@ impl ComponentSession {
         // returns quickly and the session can be cached/reused immediately.
         let monitor = ComponentIndexMonitor::new_with_trigger_no_scan(
             build_dir.to_path_buf(),
+            index_dir_for_monitor,
             compilation_database.clone(),
             index_reader,
             clangd_version,
@@ -208,12 +237,21 @@ impl ComponentSession {
 
         let monitor_arc = Arc::new(monitor);
 
-        // Deliberately do NOT run an in-process scan of the on-disk .idx files here:
-        // clangd itself loads the existing index into RAM via --background-index and
-        // reports progress via $/progress (overall begin/report/end). Re-parsing all
-        // ~100k idx files inside the server would duplicate clangd's work, consume
-        // gigabytes and every CPU core, and starve the clangd child. Instead we only
-        // kick off indexing (opens one file) and let clangd drive the completion
+        // Reconcile with the shards already on disk, in the background.
+        //
+        // This must not run inline: on a large tree it parses every existing .idx
+        // file, which would duplicate clangd's work and stall session creation for
+        // minutes. But it must run *somewhere*, because clangd only reports work it
+        // actually performs -- on an already-indexed tree it emits no $/progress at
+        // all, leaving the monitor stuck at Init/0 with no evidence to correct it.
+        // Off the request path, it costs nothing that clangd was not already doing
+        // and short-circuits immediately when no index files exist.
+        let scan_monitor = Arc::clone(&monitor_arc);
+        tokio::spawn(async move {
+            scan_monitor.perform_initial_scan().await;
+        });
+
+        // Kick off indexing (opens one file) and let clangd drive the completion
         // latch. Searches wait on that latch, bounded by the tool's wait_timeout.
         if let Err(e) = monitor_arc
             .trigger_initial_indexing(compilation_database.clone())
@@ -290,6 +328,15 @@ impl ComponentSession {
         &self.component
     }
 
+    /// Default bound on waiting for indexing, from the resolved application config.
+    ///
+    /// Tools use this whenever the caller did not pass an explicit `wait_timeout`,
+    /// so a project can raise the bound for a tree that takes minutes to index
+    /// without every request having to spell it out.
+    pub fn index_wait_timeout(&self) -> Duration {
+        self.index_wait_timeout
+    }
+
     /// Wait for indexing completion before proceeding with LSP operations
     ///
     /// This method waits for clangd to complete indexing and ensures that all files
@@ -333,6 +380,8 @@ impl ComponentSession {
     /// including ETA calculation if applicable.
     pub async fn get_index_status(&self) -> IndexStatusView {
         let (component_state, start_time) = self.index_monitor.get_progress_data().await;
+        let scan_in_progress =
+            self.index_monitor.initial_scan_state().await != InitialScanState::Complete;
 
         // Determine if indexing is in progress
         let in_progress = matches!(component_state.state, ComponentIndexingState::InProgress(_));
@@ -360,6 +409,7 @@ impl ComponentSession {
             component_state.total_cdb_files,
             start_time,
             state_str,
+            scan_in_progress,
         )
     }
 }

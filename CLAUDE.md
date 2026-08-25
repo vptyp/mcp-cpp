@@ -29,7 +29,7 @@ This is a **C++ MCP (Model Context Protocol) server** implemented in Rust that b
 ### ✅ Completed
 
 - Full MCP server implementation with rust-mcp-sdk
-- CMake project analysis and build directory management (`list_build_dirs`)
+- Multi-provider project analysis and build directory management (`get_project_details`)
 - Comprehensive C++ symbol search with project boundary detection (`search_symbols`)
 - Deep symbol analysis with inheritance and call hierarchy (`analyze_symbol_context`)
 - Clangd LSP client with lifecycle management and indexing progress tracking
@@ -95,7 +95,7 @@ src/
 
 tools/
 ├── lsp-cli.py           // Standalone Python CLI for MCP server interaction
-├── requirements.txt     // Python dependencies (rich>=13.0.0)
+├── requirements.txt     // Python dependencies (rich, for clangd-idx-viewer.py only)
 ├── generate-index.py    // Symbol indexing tool
 └── clangd-idx-viewer.py // Clangd index debugging utility
 ```
@@ -129,59 +129,76 @@ The Python CLI tool provides a **convenient command-line interface** to the MCP 
 **Basic Usage Pattern:**
 
 ```bash
-# Navigate to any C++ project with CMake
+# Navigate to any C++ project with CMake or Meson
 cd /path/to/cpp/project
 
-# Set clangd path if needed (for version compatibility)
+# Point at a specific clangd if the default on PATH is the wrong version
 export CLANGD_PATH=/usr/bin/clangd-20
 
 # Use the CLI tool
-python3 /path/to/mcp-cpp/tools/lsp-cli.py [COMMAND] [OPTIONS]
+python3 /path/to/mcp-cpp/tools/lsp-cli.py <COMMAND> [OPTIONS]
 ```
+
+Every command has a long name matching its MCP tool and a short alias; the
+short form is preferred in day-to-day use. `--help` on any command lists its
+options with real descriptions.
 
 **Available Commands:**
 
-1. **Project Analysis:**
+1. **Project layout** — build directories, compilation databases, and the
+   configuration the server actually resolved:
 
    ```bash
-   # Get comprehensive project details including build configurations and components
-   python3 tools/lsp-cli.py get-project-details
+   python3 tools/lsp-cli.py project
    ```
 
-2. **Symbol Search:**
+2. **Index status** — how far clangd has got, without running a search:
 
    ```bash
-   # Find symbols quickly
-   python3 tools/lsp-cli.py search-symbols "Math"
-   python3 tools/lsp-cli.py search-symbols "vector" --max-results 20
-   python3 tools/lsp-cli.py search-symbols "std::" --include-external
+   python3 tools/lsp-cli.py index
+   python3 tools/lsp-cli.py index --build-directory build-debug --wait-timeout 300
    ```
 
-3. **Deep Symbol Analysis:**
+3. **Symbol search:**
 
    ```bash
-   # Comprehensive symbol analysis (automatic analysis based on symbol type)
-   python3 tools/lsp-cli.py analyze-symbol "Math::factorial" --max-examples 5
-   python3 tools/lsp-cli.py analyze-symbol "MyClass" --location-hint "/path/file.cpp:42:15"
-   python3 tools/lsp-cli.py analyze-symbol "factorial" --wait-timeout 0 --no-code
+   python3 tools/lsp-cli.py search Math
+   python3 tools/lsp-cli.py search vector --max-results 20
+   python3 tools/lsp-cli.py search Buffer --kind Class Struct
+   python3 tools/lsp-cli.py search "" --files include/Math.hpp   # list a file's symbols
+   python3 tools/lsp-cli.py search std:: --include-external
    ```
 
-4. **Tool Discovery:**
+4. **Deep symbol analysis** (the tool picks the analyses that apply to the
+   symbol's kind — there are no flags for inheritance or call hierarchy):
+
    ```bash
-   # See all available MCP tools
-   python3 tools/lsp-cli.py list-tools
+   python3 tools/lsp-cli.py analyze Math::factorial --max-examples 5
+   python3 tools/lsp-cli.py analyze MyClass --location-hint /path/file.cpp:42:15
    ```
 
-**Output Modes:**
+5. **Diagnostics** — clangd's errors, warnings and notes for one file:
 
-- **Pretty Mode (default)**: Rich formatted tables, colors, structured display
-- **Raw Mode**: Clean JSON for scripting: `--raw-output`
+   ```bash
+   python3 tools/lsp-cli.py diagnostics src/calculator.cpp
+   ```
 
-**Key Options:**
+**Output Modes** (`--format`, applies to every command):
 
-- `--server-path`: Specify custom MCP server binary location
-- `--raw-output`: Get JSON output instead of pretty formatting
-- All tool-specific parameters supported (build directories, filtering, analysis depth, etc.)
+- `yaml` (default): compact, readable, no decoration — the form intended for
+  both humans and agents
+- `json`: the tool result as JSON, for scripting
+- `raw`: the full JSON-RPC response, unmodified, for debugging the protocol
+
+**Connection Options:**
+
+- `--server-path PATH`: server binary to spawn (found on PATH or under
+  `./target` by default)
+- `--http-url URL`: talk to an already-running server over HTTP instead of
+  spawning one
+- `--config PATH`: connection cache file (default: nearest `.lsp-cli.json` in
+  a parent directory)
+- `--debug`: print a full traceback when the CLI itself fails
 
 ### **When I Should Use This Tool**
 
@@ -189,32 +206,35 @@ python3 /path/to/mcp-cpp/tools/lsp-cli.py [COMMAND] [OPTIONS]
 
 - **Code exploration**: Quickly understand unfamiliar C++ codebases
 - **Symbol lookup**: Find function definitions, class hierarchies, usage patterns
-- **Build troubleshooting**: Analyze CMake configuration and compilation database status
+- **Build troubleshooting**: Analyze build configuration and compilation database status
 - **Architecture analysis**: Understand class relationships and call patterns
 - **Development workflow**: Integrate into shell scripts for automated code analysis
 
 **Advantages Over Direct MCP Server:**
 
 - **No JSON-RPC knowledge required** - simple command-line interface
-- **Built-in formatting** - human-readable output without parsing JSON
-- **Comprehensive help** - detailed documentation for each command
+- **Readable output** - YAML by default, JSON on request
+- **Comprehensive help** - real descriptions for every command and option
 - **Error handling** - user-friendly error messages
 - **Shell integration** - works seamlessly in terminal workflows
 
 **Example Workflow:**
 
 ```bash
-# 1. Analyze project structure and build configurations
-python3 tools/lsp-cli.py get-project-details
+# 1. Discover build directories and confirm the resolved configuration
+python3 tools/lsp-cli.py project
 
-# 2. Find symbols of interest
-python3 tools/lsp-cli.py search-symbols "Calculator" --kinds class function
+# 2. Confirm clangd has finished indexing before trusting a workspace search
+python3 tools/lsp-cli.py index --wait-timeout 300
 
-# 3. Deep dive into specific symbols
-python3 tools/lsp-cli.py analyze-symbol "Calculator::compute" --include-usage-patterns
+# 3. Find symbols of interest
+python3 tools/lsp-cli.py search Calculator --kind Class Function
 
-# 4. Export results for further processing
-python3 tools/lsp-cli.py search-symbols "Math::" --raw-output > math_symbols.json
+# 4. Deep dive into a specific symbol
+python3 tools/lsp-cli.py analyze Calculator::compute
+
+# 5. Export results for further processing
+python3 tools/lsp-cli.py --format json search Math:: > math_symbols.json
 ```
 
 This tool essentially **democratizes access** to the powerful MCP server capabilities, making semantic C++ code analysis available through simple command-line operations.
@@ -262,10 +282,9 @@ cargo run
 cargo watch -x test        # Auto-run tests on file changes
 cargo watch -x run         # Auto-restart server on changes
 
-# Use the Python CLI tool
-cd tools && pip3 install -r requirements.txt  # Install dependencies
-python3 lsp-cli.py --help   # Get help
-python3 lsp-cli.py list-tools
+# Use the Python CLI tool (no third-party dependencies required)
+python3 tools/lsp-cli.py --help          # Commands and global options
+python3 tools/lsp-cli.py search --help   # Options for one command
 ```
 
 ## Repository Structure
@@ -273,7 +292,7 @@ python3 lsp-cli.py list-tools
 - `src/`: Rust source code with modular LSP and tool implementations
 - `tools/`: Utility tools and CLI interfaces
   - `lsp-cli.py`: **Standalone Python CLI tool for easy MCP server interaction**
-  - `requirements.txt`: Python dependencies for the CLI tool
+  - `requirements.txt`: Python dependencies for `clangd-idx-viewer.py` (`lsp-cli.py` needs none)
   - `generate-index.py`: Symbol indexing tool
 - `test/`: Test projects and fixtures for validation
   - `test/e2e/`: End-to-end testing framework (Node.js/TypeScript)
@@ -770,8 +789,8 @@ cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo t
 cargo build && cd test/e2e && npm test
 
 # CLI tool validation
-python3 tools/lsp-cli.py get-project-details
-python3 tools/lsp-cli.py search-symbols "pattern"
+python3 tools/lsp-cli.py project
+python3 tools/lsp-cli.py search pattern
 
 # Debug preserved test failures
 cd test/e2e && npm run inspect:verbose
@@ -834,3 +853,11 @@ Do what has been asked; nothing more, nothing less.
 NEVER create files unless they're absolutely necessary for achieving your goal.
 
       IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context or otherwise consider it in your response unless it is highly relevant to your task. Most of the time, it is not relevant.
+
+<!-- OPENWIKI:START -->
+
+## OpenWiki
+
+See [AGENTS.md](AGENTS.md) for OpenWiki agent instructions.
+
+<!-- OPENWIKI:END -->

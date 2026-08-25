@@ -1,42 +1,28 @@
 #!/usr/bin/env python3
-"""
-MCP CLI Tool - Command line interface for the C++ MCP Server
+"""Command line interface for the C++ MCP server.
 
-This tool provides a convenient way to interact with the MCP C++ server
-from the command line, supporting all available tools with comprehensive
-argument handling and pretty-formatted output.
+Output is YAML by default: one fact per line, no decoration, no ANSI. Data goes
+to stdout, errors go to stderr with a non-zero exit code, so the tool composes
+in pipelines and is unambiguous to read.
 """
 
 import argparse
 import errno
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
-import os
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Union
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-# Default per-project cache/config file name. Stores python-side cache vars
-# (transport, http_url, session_id, server_path, ...) so the CLI can auto-connect
-# to a running server without re-passing flags.
+# Per-project cache file. Stores connection vars (transport, http_url,
+# session_id, server_path) so repeat calls auto-connect without re-passing flags.
 DEFAULT_CONFIG_FILE = ".lsp-cli.json"
-
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.syntax import Syntax
-    from rich.tree import Tree
-    from rich import print as rprint
-    RICH_AVAILABLE = True
-except ImportError:
-    RICH_AVAILABLE = False
-    console = None
-
 
 class McpCliError(Exception):
     """Custom exception for MCP CLI errors"""
@@ -66,7 +52,6 @@ class McpClient:
         self.attach_timeout = attach_timeout
         self.http_url = http_url
         self.session_id = session_id
-        self.console = Console() if RICH_AVAILABLE else None
         
     def _validate_server(self) -> None:
         """Validate that the MCP server exists and is executable"""
@@ -309,21 +294,42 @@ class McpClient:
         return self._send_request("tools/call", params)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Server and config discovery
+# ---------------------------------------------------------------------------
+
+
 def find_server_binary() -> str:
-    """Find the MCP server binary in PATH"""
-    import shutil
-    if shutil.which("mcp-cpp-server"):
-        return "mcp-cpp-server"
-    
-    raise McpCliError("Could not find mcp-cpp-server binary. Please install it in PATH or specify --server-path")
+    """Locate the mcp-cpp-server binary.
+
+    Checks PATH first, then walks up from the current directory looking for a
+    cargo build output, so the CLI works inside a checkout without installing.
+    """
+    found = shutil.which("mcp-cpp-server")
+    if found:
+        return found
+
+    d = os.path.abspath(os.getcwd())
+    while True:
+        for profile in ("release", "debug"):
+            candidate = os.path.join(d, "target", profile, "mcp-cpp-server")
+            if os.access(candidate, os.X_OK):
+                return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+
+    raise McpCliError(
+        "Could not find mcp-cpp-server. Build it with 'cargo build --release', "
+        "install it in PATH, or pass --server-path."
+    )
 
 
 def _find_config_file(explicit: Optional[str] = None) -> Optional[str]:
-    """Locate the .lsp-cli.json cache file.
-
-    Searches upward from the current directory so the CLI auto-discovers the
-    project-root config. An explicit ``--config`` path wins if provided.
-    """
+    """Locate the .lsp-cli.json cache file by walking up from the current directory."""
     if explicit:
         return explicit
     d = os.path.abspath(os.getcwd())
@@ -335,328 +341,184 @@ def _find_config_file(explicit: Optional[str] = None) -> Optional[str]:
         if parent == d:
             return None
         d = parent
-    return None
 
 
 def _load_config(config_path: Optional[str] = None):
-    """Load the cache/config file, returning ``(cache, resolved_path)``."""
+    """Load the cache file, returning ``(cache, resolved_path_or_None)``."""
     path = _find_config_file(config_path)
     if not path:
         return {}, None
     try:
         with open(path, "r") as f:
             return json.load(f), path
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return {}, path
 
 
 def _save_config(cache: Dict, path: str) -> None:
-    """Write the cache/config file, ignoring failures (non-fatal)."""
+    """Write the cache file. Failures are warnings, not errors."""
     if not path:
         return
     try:
         with open(path, "w") as f:
             json.dump(cache, f, indent=2)
     except OSError as e:
-        print(f"Warning: could not write config file {path}: {e}", file=sys.stderr)
+        print(f"warning: could not write {path}: {e}", file=sys.stderr)
 
 
-def create_parser() -> argparse.ArgumentParser:
-    """Create the argument parser with all subcommands"""
-    parser = argparse.ArgumentParser(
-        description="Command line interface for the C++ MCP Server",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s get-index-status --build-directory /abs/path/build
-  %(prog)s search-symbols Math --max-results 20
-  %(prog)s search-class WebContents --max-results 10
-  %(prog)s search-method "WebContents::" --max-results 10
-  %(prog)s analyze-symbol "Math::sqrt" --max-examples 3
-  %(prog)s get-project-details --pretty-json
-  %(prog)s show-diagnostics src/main.cpp --build-directory /abs/path/build
-  # Connect to a running streamable-http server (also auto-read from .lsp-cli.json)
-  %(prog)s --http-url http://127.0.0.1:8080/mcp search-symbols Math
-        """
-    )
-    
-    # Global options
-    output_group = parser.add_mutually_exclusive_group()
-    output_group.add_argument(
-        "--raw-output",
-        action="store_true",
-        help="Output raw JSON instead of pretty-formatted text"
-    )
-    output_group.add_argument(
-        "--pretty-json",
-        action="store_true",
-        help="Pretty print the 'text' field of JSON-RPC response as formatted JSON"
-    )
-    parser.add_argument(
-        "--server-path",
-        type=str,
-        help="Path to the MCP server binary (auto-detected by default)"
-    )
-    parser.add_argument(
-        "--attach",
-        action="store_true",
-        help="Attach to an already-running MCP server instead of spawning a new one. "
-             "Requires --fifo and --output."
-    )
-    parser.add_argument(
-        "--fifo",
-        type=str,
-        help="Path to the FIFO the running server reads requests from (its stdin)"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        help="Path to the file the running server writes responses to (its stdout)"
-    )
-    parser.add_argument(
-        "--attach-timeout",
-        type=float,
-        default=30.0,
-        help="Timeout in seconds to wait for a response from the attached server (default: 30)"
-    )
-    parser.add_argument(
-        "--http-url",
-        type=str,
-        help="URL of a running streamable-http MCP server (e.g. http://127.0.0.1:8080/mcp). "
-             "Overrides the cached value in .lsp-cli.json."
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        help=f"Path to the cache/config file (default: {DEFAULT_CONFIG_FILE} in the project directory)"
-    )
-    
-    # Subcommands
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    
-    # get-index-status subcommand
-    index_status_parser = subparsers.add_parser(
-        "get-index-status",
-        help="Show only the current clangd indexing status for a build directory"
-    )
-    index_status_parser.add_argument(
-        "--build-directory",
-        type=str,
-        help="Specify build directory path containing compile_commands.json"
-    )
-    index_status_parser.add_argument(
-        "--wait-timeout",
-        type=int,
-        help="Seconds to wait for indexing to complete before returning status (default: 0 = immediate current status)"
-    )
-    # search-symbols subcommand
-    search_parser = subparsers.add_parser(
-        "search-symbols",
-        help="Search for C++ symbols in the codebase"
-    )
-    search_parser.add_argument(
-        "query",
-        nargs="?",
-        default="",
-        help="Search query (supports fuzzy matching and qualified names). Use empty string \"\" with --files to list all symbols in specified files."
-    )
-    search_parser.add_argument(
-        "--kinds",
-        nargs="+",
-        help="Filter by symbol types (class, function, method, variable, etc.)"
-    )
-    search_parser.add_argument(
-        "--files",
-        nargs="+",
-        help="Limit search to specific files"
-    )
-    search_parser.add_argument(
-        "--max-results",
-        type=int,
-        default=100,
-        help="Maximum number of results to return (1-1000, default: 100)"
-    )
-    search_parser.add_argument(
-        "--include-external",
-        action="store_true",
-        help="Include symbols from external/system libraries"
-    )
-    search_parser.add_argument(
-        "--build-directory",
-        type=str,
-        help="Specify build directory path"
-    )
-    search_parser.add_argument(
-        "--wait-timeout",
-        type=int,
-        help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
-    )
+def _project_root(config_path: Optional[str]) -> str:
+    """Directory that output paths are reported relative to.
 
-    # search-class subcommand: convenience wrapper that filters to class-like kinds
-    search_class_parser = subparsers.add_parser(
-        "search-class",
-        help="Search for C++ classes/structs/interfaces (kinds: Class, Struct, Interface)"
-    )
-    search_class_parser.add_argument(
-        "query",
-        nargs="?",
-        default="",
-        help="Search query (supports fuzzy matching and qualified names)"
-    )
-    search_class_parser.add_argument(
-        "--files",
-        nargs="+",
-        help="Limit search to specific files"
-    )
-    search_class_parser.add_argument(
-        "--max-results",
-        type=int,
-        default=100,
-        help="Maximum number of results to return (1-1000, default: 100)"
-    )
-    search_class_parser.add_argument(
-        "--include-external",
-        action="store_true",
-        help="Include symbols from external/system libraries"
-    )
-    search_class_parser.add_argument(
-        "--build-directory",
-        type=str,
-        help="Specify build directory path"
-    )
-    search_class_parser.add_argument(
-        "--wait-timeout",
-        type=int,
-        help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
-    )
-
-    # search-method subcommand: convenience wrapper that filters to method-like kinds
-    search_method_parser = subparsers.add_parser(
-        "search-method",
-        help="Search for C++ methods/functions/constructors (kinds: Method, Function, Constructor)"
-    )
-    search_method_parser.add_argument(
-        "query",
-        nargs="?",
-        default="",
-        help="Search query (supports fuzzy matching and qualified names)"
-    )
-    search_method_parser.add_argument(
-        "--files",
-        nargs="+",
-        help="Limit search to specific files"
-    )
-    search_method_parser.add_argument(
-        "--max-results",
-        type=int,
-        default=100,
-        help="Maximum number of results to return (1-1000, default: 100)"
-    )
-    search_method_parser.add_argument(
-        "--include-external",
-        action="store_true",
-        help="Include symbols from external/system libraries"
-    )
-    search_method_parser.add_argument(
-        "--build-directory",
-        type=str,
-        help="Specify build directory path"
-    )
-    search_method_parser.add_argument(
-        "--wait-timeout",
-        type=int,
-        help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
-    )
-    
-    # show-diagnostics subcommand
-    diagnostics_parser = subparsers.add_parser(
-        "show-diagnostics",
-        help="Show clangd diagnostics (errors/warnings/notes) for a source file",
-    )
-    diagnostics_parser.add_argument(
-        "file",
-        help="Path to the C++ source file to check (relative paths resolved against the project root)",
-    )
-    diagnostics_parser.add_argument(
-        "--build-directory",
-        type=str,
-        help="Specify build directory path containing compile_commands.json",
-    )
-    diagnostics_parser.add_argument(
-        "--wait-timeout",
-        type=int,
-        help="Timeout in seconds to wait for clangd to publish diagnostics (default: 20, 0 = no wait)",
-    )
-
-    # analyze-symbol subcommand
-    analyze_parser = subparsers.add_parser(
-        "analyze-symbol",
-        help="Perform comprehensive analysis of a C++ symbol"
-    )
-    analyze_parser.add_argument(
-        "symbol",
-        help="Symbol name to analyze (e.g., 'Math', 'std::vector', 'MyClass::method')"
-    )
-    analyze_parser.add_argument(
-        "--max-examples",
-        type=int,
-        help="Maximum number of usage examples to include (unlimited by default)"
-    )
-    analyze_parser.add_argument(
-        "--build-directory",
-        type=str,
-        help="Specify build directory path containing compile_commands.json"
-    )
-    analyze_parser.add_argument(
-        "--no-code",
-        action="store_true",
-        help="Don't extract and display source code snippets"
-    )
-    analyze_parser.add_argument(
-        "--show-all-members",
-        action="store_true",
-        help="Show all class members instead of just a summary (useful for classes with many members)"
-    )
-    analyze_parser.add_argument(
-        "--location-hint",
-        type=str,
-        help="Location hint for disambiguating overloaded symbols (format: /path/file.cpp:line:column, 1-based)"
-    )
-    analyze_parser.add_argument(
-        "--wait-timeout",
-        type=int,
-        help="Timeout for waiting on indexing completion in seconds (default: 20, 0 = no wait)"
-    )
-    
-    # get-project-details subcommand
-    project_details_parser = subparsers.add_parser(
-        "get-project-details",
-        help="Get comprehensive project analysis including build configurations and global compilation database"
-    )
-    project_details_parser.add_argument(
-        "--path",
-        type=str,
-        help="Project root path to scan (triggers fresh scan if different from server default)"
-    )
-    project_details_parser.add_argument(
-        "--depth",
-        type=int,
-        choices=range(0, 11),
-        metavar="0-10",
-        help="Scan depth for component discovery (triggers fresh scan if different from server default)"
-    )
-    project_details_parser.add_argument(
-        "--include-details",
-        action="store_true",
-        help="Include detailed build options and configuration variables (default: false to prevent context window exhaustion)"
-    )
-    
-    return parser
+    The directory holding .lsp-cli.json when one was found, otherwise the
+    current directory. Keeps paths stable no matter which subdirectory the
+    CLI is invoked from.
+    """
+    if config_path:
+        return os.path.dirname(os.path.abspath(config_path))
+    return os.path.abspath(os.getcwd())
 
 
-# LSP SymbolKind numeric values -> readable PascalCase names.
-# The server emits numeric kinds (e.g. 5 = Class) which are opaque to LLMs,
-# so we translate them to readable names in the CLI output.
+# ---------------------------------------------------------------------------
+# YAML output
+# ---------------------------------------------------------------------------
+
+# Scalars starting with these characters, or matching a YAML keyword or number,
+# must be quoted to round-trip. Everything else is emitted bare.
+_YAML_INDICATORS = "-?:,[]{}#&*!|>'\"%@`"
+# Bare words YAML resolves to something other than a string. "=" is the
+# rarely-seen YAML "value" tag, which errors out rather than round-tripping.
+_YAML_KEYWORDS = {"true", "false", "null", "yes", "no", "on", "off", "~", "=", "<<", ""}
+
+_LOCATION_RE = re.compile(r"^(.*?)(:\d+:\d+(?:-\d+(?::\d+)?)?)$")
+
+
+def _needs_quotes(s: str) -> bool:
+    if s.strip() != s or s.lower() in _YAML_KEYWORDS:
+        return True
+    # Control characters (tabs especially) cannot appear in a plain scalar.
+    if any(c < " " or c == "\x7f" for c in s):
+        return True
+    if s[0] in _YAML_INDICATORS:
+        return True
+    # ':' only ends a key when followed by a space or the end of the line, and
+    # '#' only starts a comment after a space. Anything else is a plain scalar,
+    # which keeps paths like src/a.cpp:10:5 unquoted.
+    if ": " in s or s.endswith(":") or " #" in s:
+        return True
+    # YAML resolves more number forms than float() does -- hex (0x10), octal,
+    # underscore-separated (6_), sexagesimal (1:30). Quote anything that opens
+    # like a number and has no space, rather than enumerate every form.
+    if s[0] in "+-.0123456789" and not any(c.isspace() for c in s):
+        return True
+    return False
+
+
+def _scalar(value: Any) -> str:
+    """Render a Python scalar as a YAML scalar."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    s = str(value)
+    # json.dumps produces a double-quoted form YAML accepts verbatim.
+    return json.dumps(s) if _needs_quotes(s) else s
+
+
+def _block_scalar(s: str, indent: int) -> Optional[List[str]]:
+    """Render a multi-line string as a YAML literal block, or None if unsafe.
+
+    Documentation and hover text arrive with embedded newlines. A block scalar
+    keeps them readable instead of collapsing them into one escaped line.
+    Strings a block cannot represent faithfully (trailing spaces, other control
+    characters, a leading blank line) fall back to the quoted form.
+    """
+    if "\n" not in s:
+        return None
+    lines = s.split("\n")
+    if any(line != line.rstrip() for line in lines):
+        return None
+    if any(c < " " and c != "\n" for c in s):
+        return None
+    if lines[0].startswith(" ") or lines[0] == "":
+        return None
+
+    # Only the strip form is used. Keeping a trailing newline depends on the
+    # document itself ending in one, which is not something this emitter can
+    # guarantee, so text ending in a newline falls back to the quoted form.
+    if s.endswith("\n"):
+        return None
+    pad = "  " * (indent + 1)
+    return ["|-"] + [(pad + line if line else "") for line in lines]
+
+
+def _dump_mapping(mapping: Dict, indent: int, lines: List[str]) -> None:
+    pad = "  " * indent
+    for key, value in mapping.items():
+        k = _scalar(key)
+        if isinstance(value, dict):
+            if value:
+                lines.append(f"{pad}{k}:")
+                _dump_mapping(value, indent + 1, lines)
+            else:
+                lines.append(f"{pad}{k}: {{}}")
+        elif isinstance(value, list):
+            if value:
+                lines.append(f"{pad}{k}:")
+                _dump_sequence(value, indent, lines)
+            else:
+                lines.append(f"{pad}{k}: []")
+        elif isinstance(value, str) and (block := _block_scalar(value, indent)):
+            lines.append(f"{pad}{k}: {block[0]}")
+            lines.extend(block[1:])
+        else:
+            lines.append(f"{pad}{k}: {_scalar(value)}")
+
+
+def _dump_sequence(seq: List, indent: int, lines: List[str]) -> None:
+    pad = "  " * (indent + 1)
+    for item in seq:
+        if isinstance(item, dict) and item:
+            # Render the item one level deeper, then turn its first line into
+            # the "- " entry. Continuation lines already sit at the right depth.
+            sub: List[str] = []
+            _dump_mapping(item, indent + 2, sub)
+            lines.append(f"{pad}- {sub[0].lstrip()}")
+            lines.extend(sub[1:])
+        elif isinstance(item, list) and item:
+            sub = []
+            _dump_sequence(item, indent + 1, sub)
+            lines.append(f"{pad}- {sub[0].lstrip()}")
+            lines.extend(sub[1:])
+        elif isinstance(item, (dict, list)):
+            lines.append(f"{pad}- {'{}' if isinstance(item, dict) else '[]'}")
+        else:
+            lines.append(f"{pad}- {_scalar(item)}")
+
+
+def to_yaml(data: Any) -> str:
+    """Render a JSON-compatible value as YAML."""
+    lines: List[str] = []
+    if isinstance(data, dict):
+        if not data:
+            return "{}"
+        _dump_mapping(data, 0, lines)
+    elif isinstance(data, list):
+        if not data:
+            return "[]"
+        _dump_sequence(data, -1, lines)
+    else:
+        lines.append(_scalar(data))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Response reshaping
+# ---------------------------------------------------------------------------
+
+# LSP SymbolKind numeric values -> readable names. The server emits numbers
+# (5 = Class), which are opaque to a reader; translate them at the edge.
 _SYMBOL_KINDS = {
     1: "File", 2: "Module", 3: "Namespace", 4: "Package", 5: "Class",
     6: "Method", 7: "Property", 8: "Field", 9: "Constructor", 10: "Enum",
@@ -668,10 +530,11 @@ _SYMBOL_KINDS = {
 
 
 def _translate_symbol_kinds(obj: Any) -> Any:
-    """Recursively translate numeric LSP SymbolKind 'kind' fields to readable names."""
+    """Recursively replace numeric LSP SymbolKind values with their names."""
     if isinstance(obj, dict):
-        if "kind" in obj and isinstance(obj["kind"], int) and obj["kind"] in _SYMBOL_KINDS:
-            obj["kind"] = _SYMBOL_KINDS[obj["kind"]]
+        kind = obj.get("kind")
+        if isinstance(kind, int) and kind in _SYMBOL_KINDS:
+            obj["kind"] = _SYMBOL_KINDS[kind]
         for value in obj.values():
             _translate_symbol_kinds(value)
     elif isinstance(obj, list):
@@ -680,907 +543,460 @@ def _translate_symbol_kinds(obj: Any) -> Any:
     return obj
 
 
-def _translate_response_kinds(response: Dict) -> Dict:
-    """Translate numeric symbol kinds in the tool result's 'text' field."""
+def _relativize(path: str, root: str) -> str:
+    """Shorten an absolute path that lives under the project root."""
+    if not path.startswith("/"):
+        return path
+    try:
+        rel = os.path.relpath(path, root)
+    except ValueError:
+        return path
+    return path if rel.startswith("..") else rel
+
+
+def _shorten_location(location: Any, root: str) -> Any:
+    """Relativize the file part of a 'path:line:col' location string."""
+    if not isinstance(location, str):
+        return location
+    match = _LOCATION_RE.match(location)
+    if not match:
+        return _relativize(location, root)
+    return _relativize(match.group(1), root) + match.group(2)
+
+
+def _shorten_paths(obj: Any, root: str) -> Any:
+    """Relativize every path-like string in the payload, in place."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(value, str):
+                obj[key] = _shorten_location(value, root)
+            else:
+                _shorten_paths(value, root)
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            if isinstance(item, str):
+                obj[i] = _shorten_location(item, root)
+            else:
+                _shorten_paths(item, root)
+    return obj
+
+
+def _qualified_name(symbol: Dict) -> str:
+    """Join container and name into the name a C++ developer would write."""
+    name = str(symbol.get("name", ""))
+    container = symbol.get("container_name")
+    if container and not name.startswith(f"{container}::"):
+        return f"{container}::{name}"
+    return name
+
+
+def _symbol_line(symbol: Dict) -> str:
+    """Collapse a symbol to one unambiguous line: name | kind | location."""
+    return " | ".join(
+        (
+            _qualified_name(symbol),
+            str(symbol.get("kind", "Unknown")),
+            str(symbol.get("location", "")),
+        )
+    )
+
+
+def _collapse_symbol_lists(obj: Any) -> Any:
+    """Replace lists of symbol objects with one-line-per-symbol strings.
+
+    A symbol carries name, kind and location and nothing else worth a nested
+    block, so a flat line is both shorter and easier to scan.
+    """
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            obj[key] = _collapse_symbol_lists(value)
+        return obj
+    if isinstance(obj, list):
+        if obj and all(
+            isinstance(i, dict) and "name" in i and "kind" in i and "location" in i
+            for i in obj
+        ):
+            return [_symbol_line(i) for i in obj]
+        return [_collapse_symbol_lists(i) for i in obj]
+    return obj
+
+
+def _drop_nulls(obj: Any) -> Any:
+    """Remove keys whose value is null.
+
+    An absent field and a null field mean the same thing here, and printing the
+    null only adds a line the reader has to dismiss.
+    """
+    if isinstance(obj, dict):
+        return {k: _drop_nulls(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_drop_nulls(i) for i in obj]
+    return obj
+
+
+def _is_tool_error(response: Dict) -> bool:
+    """True when the server reported the tool call itself as failed."""
     result = response.get("result")
-    if not result or "content" not in result:
-        return response
-    for content_item in result["content"]:
-        if not isinstance(content_item, dict) or "text" not in content_item:
+    return isinstance(result, dict) and bool(result.get("isError"))
+
+
+def _error_text(response: Dict) -> str:
+    """Pull the human-readable message out of a failed tool call."""
+    result = response.get("result") or {}
+    parts = [
+        c["text"]
+        for c in (result.get("content") or [])
+        if isinstance(c, dict) and isinstance(c.get("text"), str)
+    ]
+    return "\n".join(parts) if parts else "tool call failed"
+
+
+def extract_payload(response: Dict) -> Any:
+    """Pull the tool result out of the JSON-RPC envelope.
+
+    Tool results arrive as a JSON document inside a text content block; unwrap
+    it so downstream formatting sees plain data.
+    """
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise McpCliError("Malformed response: missing 'result'")
+
+    content = result.get("content")
+    if not content:
+        return result
+
+    texts = [c["text"] for c in content if isinstance(c, dict) and "text" in c]
+    if not texts:
+        return result
+
+    joined = "\n".join(texts)
+    try:
+        return json.loads(joined)
+    except json.JSONDecodeError:
+        return joined
+
+
+def shape_payload(payload: Any, root: str) -> Any:
+    """Apply the output contract: readable kinds, short paths, flat symbols.
+
+    'success' is dropped because failure is already reported by a non-zero exit
+    code, so it never carries information on the path where it is printed.
+    """
+    if isinstance(payload, dict):
+        payload.pop("success", None)
+    _translate_symbol_kinds(payload)
+    _shorten_paths(payload, root)
+    return _drop_nulls(_collapse_symbol_lists(payload))
+
+
+# ---------------------------------------------------------------------------
+# Command line interface
+# ---------------------------------------------------------------------------
+
+SYMBOL_KIND_CHOICES = sorted(set(_SYMBOL_KINDS.values()))
+
+_EPILOG = """\
+examples:
+  lsp-cli.py project                             list build directories to use below
+  lsp-cli.py index --build-directory build       check whether clangd has finished indexing
+  lsp-cli.py search Math                         find symbols whose name matches "Math"
+  lsp-cli.py search Buffer --kind Class Struct   restrict the search to types
+  lsp-cli.py search "" --files src/main.cpp      list every symbol defined in one file
+  lsp-cli.py analyze Math::factorial             definition, callers, members and usages
+  lsp-cli.py diagnostics src/main.cpp            compiler errors and warnings for one file
+
+output:
+  YAML on stdout. Errors go to stderr and exit non-zero.
+  Symbols are printed one per line as: name | kind | path:line:column
+  Paths are relative to the project root; lines and columns are 1-based.
+"""
+
+
+def _add_build_directory(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--build-directory",
+        metavar="DIR",
+        help="Build directory holding compile_commands.json. "
+             "Defaults to the one the server auto-detects; run 'project' to list them.",
+    )
+
+
+def _add_wait_timeout(parser: argparse.ArgumentParser, what: str) -> None:
+    parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        metavar="SECONDS",
+        help=f"Seconds to wait for {what} before answering. 0 answers immediately.",
+    )
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lsp-cli.py",
+        description="Query a C++ codebase semantically through clangd.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_EPILOG,
+    )
+    parser.add_argument(
+        "--format",
+        choices=("yaml", "json", "raw"),
+        default="yaml",
+        help="yaml: readable output (default). "
+             "json: the tool result as JSON. "
+             "raw: the full JSON-RPC response, unmodified.",
+    )
+    parser.add_argument(
+        "--server-path",
+        metavar="PATH",
+        help="mcp-cpp-server binary to run. Found on PATH or under ./target by default.",
+    )
+    parser.add_argument(
+        "--http-url",
+        metavar="URL",
+        help="Talk to a running server over HTTP instead of spawning one, "
+             "e.g. http://127.0.0.1:8080/mcp",
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help=f"Connection cache file (default: nearest {DEFAULT_CONFIG_FILE} in a parent directory).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print a full traceback when the CLI itself fails.",
+    )
+
+    # Attach transport: kept working for the E2E harness, hidden from --help
+    # because it is test plumbing rather than a user-facing feature.
+    parser.add_argument("--attach", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--fifo", help=argparse.SUPPRESS)
+    parser.add_argument("--output", help=argparse.SUPPRESS)
+    parser.add_argument("--attach-timeout", type=float, default=30.0, help=argparse.SUPPRESS)
+
+    commands = parser.add_subparsers(dest="command", metavar="<command>")
+
+    project = commands.add_parser(
+        "project",
+        aliases=["get-project-details"],
+        help="Show the project layout: build directories and compilation databases",
+    )
+    project.add_argument("--path", metavar="DIR", help="Project root to scan instead of the server's.")
+    project.add_argument(
+        "--depth", type=int, choices=range(0, 11), metavar="0-10",
+        help="How many directory levels to search for build directories.",
+    )
+    project.add_argument(
+        "--include-details", action="store_true",
+        help="Also list every build option and configuration variable. Verbose.",
+    )
+
+    index = commands.add_parser(
+        "index",
+        aliases=["get-index-status"],
+        help="Show how far clangd has got indexing a build directory",
+    )
+    _add_build_directory(index)
+    _add_wait_timeout(index, "indexing to finish")
+
+    search = commands.add_parser(
+        "search",
+        aliases=["search-symbols"],
+        help="Find symbols by name across the project",
+    )
+    search.add_argument(
+        "query", nargs="?", default="",
+        help="Name to match. Fuzzy and qualified names both work "
+             "(Math, Math::factorial). Pass \"\" with --files to list a file's symbols.",
+    )
+    search.add_argument(
+        "--kind", nargs="+", dest="kinds", metavar="KIND", choices=SYMBOL_KIND_CHOICES,
+        help="Keep only these kinds. One or more of: " + ", ".join(SYMBOL_KIND_CHOICES),
+    )
+    search.add_argument(
+        "--files", nargs="+", metavar="FILE",
+        help="Search inside these files only. Slower, but returns every match; "
+             "without it clangd's index may omit some.",
+    )
+    search.add_argument(
+        "--max-results", type=int, default=100, metavar="N",
+        help="Stop after N symbols (default: 100).",
+    )
+    search.add_argument(
+        "--include-external", action="store_true",
+        help="Also match symbols from system headers and third-party libraries.",
+    )
+    _add_build_directory(search)
+    _add_wait_timeout(search, "indexing to finish")
+
+    analyze = commands.add_parser(
+        "analyze",
+        aliases=["analyze-symbol"],
+        help="Show a symbol's definition, callers, members and example usages",
+    )
+    analyze.add_argument("symbol", help="Symbol to analyze, e.g. Math::factorial or MyClass.")
+    analyze.add_argument(
+        "--max-examples", type=int, metavar="N",
+        help="Cap the number of usage examples. All of them by default.",
+    )
+    analyze.add_argument(
+        "--location-hint", metavar="FILE:LINE:COL",
+        help="Pick a specific overload by where it is declared. Lines and columns are 1-based.",
+    )
+    _add_build_directory(analyze)
+    _add_wait_timeout(analyze, "indexing to finish")
+
+    diagnostics = commands.add_parser(
+        "diagnostics",
+        aliases=["show-diagnostics"],
+        help="Show clangd errors, warnings and notes for one source file",
+    )
+    diagnostics.add_argument("file", help="Source file to check. Relative paths resolve against the project root.")
+    _add_build_directory(diagnostics)
+    _add_wait_timeout(diagnostics, "clangd to report")
+
+    return parser
+
+
+# Subcommand name (including aliases) -> MCP tool name.
+_TOOL_FOR_COMMAND = {
+    "project": "get_project_details",
+    "get-project-details": "get_project_details",
+    "index": "get_index_status",
+    "get-index-status": "get_index_status",
+    "search": "search_symbols",
+    "search-symbols": "search_symbols",
+    "analyze": "analyze_symbol_context",
+    "analyze-symbol": "analyze_symbol_context",
+    "diagnostics": "show_diagnostics",
+    "show-diagnostics": "show_diagnostics",
+}
+
+# Subcommand -> (CLI attribute, tool argument). Attributes left at their
+# default are omitted so the server applies its own defaults.
+_ARGUMENTS_FOR_TOOL = {
+    "get_project_details": [("path", "path"), ("depth", "depth"), ("include_details", "include_details")],
+    "get_index_status": [("build_directory", "build_directory"), ("wait_timeout", "wait_timeout")],
+    "search_symbols": [
+        ("query", "query"), ("kinds", "kinds"), ("files", "files"),
+        ("max_results", "max_results"), ("include_external", "include_external"),
+        ("build_directory", "build_directory"), ("wait_timeout", "wait_timeout"),
+    ],
+    "analyze_symbol_context": [
+        ("symbol", "symbol"), ("max_examples", "max_examples"),
+        ("location_hint", "location_hint"), ("build_directory", "build_directory"),
+        ("wait_timeout", "wait_timeout"),
+    ],
+    "show_diagnostics": [
+        ("file", "file"), ("build_directory", "build_directory"), ("wait_timeout", "wait_timeout"),
+    ],
+}
+
+
+def build_tool_arguments(tool: str, args: argparse.Namespace) -> Dict:
+    """Turn parsed CLI arguments into the MCP tool's argument object."""
+    arguments: Dict[str, Any] = {}
+    for attribute, name in _ARGUMENTS_FOR_TOOL[tool]:
+        value = getattr(args, attribute, None)
+        # None means "not given"; False and [] mean "flag absent". An empty
+        # query string is meaningful, so it is passed through explicitly.
+        if value is None or value == [] or value is False:
             continue
-        try:
-            data = json.loads(content_item["text"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        _translate_symbol_kinds(data)
-        content_item["text"] = json.dumps(data)
-    return response
-
-
-def _build_search_arguments(args, kinds: Optional[List[str]] = None) -> Dict:
-    """Build the arguments dict for a search_symbols call from parsed CLI args."""
-    arguments = {"query": args.query}
-
-    if kinds:
-        arguments["kinds"] = kinds
-    elif getattr(args, 'kinds', None):
-        arguments["kinds"] = args.kinds
-    if getattr(args, 'files', None):
-        arguments["files"] = args.files
-    if getattr(args, 'max_results', 100) != 100:
-        arguments["max_results"] = args.max_results
-    if getattr(args, 'include_external', False):
-        arguments["include_external"] = args.include_external
-    if getattr(args, 'build_directory', None):
-        arguments["build_directory"] = args.build_directory
-    if getattr(args, 'wait_timeout', None) is not None:
-        arguments["wait_timeout"] = args.wait_timeout
-
+        arguments[name] = value
+    if tool == "search_symbols":
+        arguments["query"] = args.query
     return arguments
 
 
-def main():
-    """Main entry point"""
+def create_client(args: argparse.Namespace, config: Dict) -> "McpClient":
+    """Pick a transport: explicit HTTP, cached HTTP, attached FIFO, or spawn."""
+    http_url = args.http_url or config.get("http_url")
+    if http_url:
+        return McpClient(
+            http_url=http_url,
+            session_id=config.get("session_id"),
+            attach_timeout=args.attach_timeout,
+        )
+    if args.attach:
+        if not args.fifo or not args.output:
+            raise McpCliError("--attach requires both --fifo and --output")
+        return McpClient(
+            fifo_path=args.fifo,
+            output_path=args.output,
+            attach_timeout=args.attach_timeout,
+        )
+    return McpClient(args.server_path or find_server_binary())
+
+
+def run(args: argparse.Namespace) -> int:
+    config, config_path = _load_config(args.config)
+    client = create_client(args, config)
+
+    tool = _TOOL_FOR_COMMAND[args.command]
+    response = client.call_tool(tool, build_tool_arguments(tool, args))
+
+    # Cache the HTTP session next to the project root, not the current
+    # directory, so running from a subdirectory does not scatter config files.
+    if client.http_url and client.session_id:
+        target = args.config or config_path or os.path.join(
+            _project_root(config_path), DEFAULT_CONFIG_FILE
+        )
+        _save_config(
+            {
+                "transport": "http",
+                "http_url": client.http_url,
+                "session_id": client.session_id,
+                "server_path": args.server_path or config.get("server_path"),
+            },
+            target,
+        )
+
+    if args.format == "raw":
+        print(json.dumps(response, indent=2))
+        return 0 if not _is_tool_error(response) else 1
+
+    # A tool that fails reports it in the result rather than as a JSON-RPC
+    # error, so check for it explicitly; otherwise the message would be
+    # printed as if it were data and the exit code would claim success.
+    if _is_tool_error(response):
+        raise McpCliError(_error_text(response))
+
+    payload = extract_payload(response)
+    if args.format == "json":
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(to_yaml(shape_payload(payload, _project_root(config_path))))
+    return 0
+
+
+def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
-    
-    # Show help if no command specified
+
     if not args.command:
         parser.print_help()
-        sys.exit(1)
-    
+        return 2
+
     try:
-        # Load python-side cache vars from .lsp-cli.json (if present).
-        config, config_path = _load_config(args.config)
-
-        # Determine the HTTP endpoint: explicit --http-url wins over the cache.
-        http_url = args.http_url or config.get("http_url")
-
-        if http_url:
-            client = McpClient(
-                http_url=http_url,
-                session_id=config.get("session_id"),
-                attach_timeout=args.attach_timeout,
-            )
-        # Attach mode: talk to an already-running server via FIFO + output log.
-        elif args.attach:
-            if not args.fifo or not args.output:
-                raise McpCliError("--attach requires both --fifo and --output")
-            client = McpClient(
-                fifo_path=args.fifo,
-                output_path=args.output,
-                attach_timeout=args.attach_timeout,
-            )
-        else:
-            # Find server binary
-            server_path = args.server_path or find_server_binary()
-            client = McpClient(server_path)
-        
-        # Execute the appropriate command
-        if args.command == "search-symbols":
-            response = client.call_tool("search_symbols", _build_search_arguments(args))
-            
-        elif args.command == "search-class":
-            response = client.call_tool(
-                "search_symbols",
-                _build_search_arguments(args, kinds=["Class", "Struct", "Interface"]),
-            )
-            
-        elif args.command == "search-method":
-            response = client.call_tool(
-                "search_symbols",
-                _build_search_arguments(args, kinds=["Method", "Function", "Constructor"]),
-            )
-            
-        elif args.command == "analyze-symbol":
-            arguments = {"symbol": args.symbol}
-            
-            # Add optional parameters
-            if args.max_examples is not None:
-                arguments["max_examples"] = args.max_examples
-            if args.build_directory:
-                arguments["build_directory"] = args.build_directory
-            if args.location_hint:
-                arguments["location_hint"] = args.location_hint
-            if args.wait_timeout is not None:
-                arguments["wait_timeout"] = args.wait_timeout
-                
-            response = client.call_tool("analyze_symbol_context", arguments)
-            
-        elif args.command == "get-index-status":
-            arguments = {}
-            if getattr(args, 'build_directory', None):
-                arguments["build_directory"] = args.build_directory
-            if getattr(args, 'wait_timeout', None) is not None:
-                arguments["wait_timeout"] = args.wait_timeout
-            response = client.call_tool("get_index_status", arguments)
-
-        elif args.command == "get-project-details":
-            arguments = {}
-            if hasattr(args, 'path') and args.path:
-                arguments["path"] = args.path
-            if hasattr(args, 'depth') and args.depth is not None:
-                arguments["depth"] = args.depth
-            if hasattr(args, 'include_details') and args.include_details:
-                arguments["include_details"] = True
-            response = client.call_tool("get_project_details", arguments)
-
-        elif args.command == "show-diagnostics":
-            arguments = {"file": args.file}
-            if args.build_directory:
-                arguments["build_directory"] = args.build_directory
-            if args.wait_timeout is not None:
-                arguments["wait_timeout"] = args.wait_timeout
-            response = client.call_tool("show_diagnostics", arguments)
-        
-        # Translate numeric symbol kinds to readable names for LLM-friendly output
-        _translate_response_kinds(response)
-
-        # On successful HTTP exchange, cache connection vars so the next call
-        # can auto-connect without flags. The file lives in the project root
-        # (current working directory) unless an explicit --config was given.
-        if http_url and getattr(client, "session_id", None):
-            target = args.config or os.path.join(os.getcwd(), DEFAULT_CONFIG_FILE)
-            _save_config(
-                {
-                    "transport": "http",
-                    "http_url": http_url,
-                    "session_id": client.session_id,
-                    "server_path": args.server_path or config.get("server_path"),
-                },
-                target,
-            )
-
-        # Output the response
-        if args.raw_output:
-            print(json.dumps(response, indent=2))
-        elif args.pretty_json:
-            format_pretty_json_output(response)
-        else:
-            # Pass flags for analyze-symbol command
-            show_code = not (args.command == "analyze-symbol" and getattr(args, 'no_code', False))
-            show_all_members = args.command == "analyze-symbol" and getattr(args, 'show_all_members', False)
-            format_output(args.command, response, show_code=show_code, show_all_members=show_all_members)
-            
+        return run(args)
     except McpCliError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
-        print("\nOperation cancelled", file=sys.stderr)
-        sys.exit(130)
+        print("cancelled", file=sys.stderr)
+        return 130
+    except BrokenPipeError:
+        # Downstream closed the pipe (e.g. '| head'); that is not a failure.
+        return 0
     except Exception as e:
-        print(f"Unexpected error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-def format_output(command: str, response: Dict, show_code: bool = True, show_all_members: bool = False) -> None:
-    """Format and display the response in a user-friendly way"""
-    if not RICH_AVAILABLE:
-        _format_simple_output(response)
-    else:
-        _format_rich_output(command, response, show_code=show_code, show_all_members=show_all_members)
-
-
-def format_pretty_json_output(response: Dict) -> None:
-    """Pretty print the 'text' field of JSON-RPC response as formatted JSON"""
-    if "result" in response and "content" in response["result"]:
-        content = response["result"]["content"]
-        if content and len(content) > 0 and "text" in content[0]:
-            try:
-                # Parse the JSON in the text field
-                data = json.loads(content[0]["text"])
-                # Pretty print it with syntax highlighting if rich is available
-                if RICH_AVAILABLE:
-                    console = Console()
-                    syntax = Syntax(json.dumps(data, indent=2), "json", theme="monokai")
-                    console.print(syntax)
-                else:
-                    print(json.dumps(data, indent=2))
-            except json.JSONDecodeError:
-                # If text field is not valid JSON, just print it as-is
-                print(content[0]["text"])
-        else:
-            print("No text content found in response")
-    else:
-        print("Invalid response format: missing result or content")
-
-
-def _format_simple_output(response: Dict) -> None:
-    """Simple text output when rich is not available"""
-    # Handle tool call responses
-    if "result" in response and "content" in response["result"]:
-        content = response["result"]["content"]
-        if content and len(content) > 0 and "text" in content[0]:
-            try:
-                data = json.loads(content[0]["text"])
-                print(json.dumps(data, indent=2))
-            except json.JSONDecodeError:
-                print(content[0]["text"])
-        else:
-            print(json.dumps(response, indent=2))
-    else:
-        print(json.dumps(response, indent=2))
-
-
-def _format_rich_output(command: str, response: Dict, show_code: bool = True, show_all_members: bool = False) -> None:
-    """Rich formatted output with colors and tables"""
-    console = Console()
-    
-    try:
-        # Extract the actual data from MCP response for tool calls
-        if "result" not in response or "content" not in response["result"]:
-            console.print("[red]Invalid response format[/red]")
-            return
-            
-        content = response["result"]["content"]
-        if not content or len(content) == 0 or "text" not in content[0]:
-            console.print("[yellow]No content in response[/yellow]")
-            return
-            
-        try:
-            data = json.loads(content[0]["text"])
-        except json.JSONDecodeError:
-            console.print("[red]Invalid JSON in response[/red]")
-            console.print(content[0]["text"])
-            return
-            
-        # Format based on command type
-        if command == "get-index-status":
-            _format_index_status(console, data.get("index_status"))
-        elif command in ("search-symbols", "search-class", "search-method"):
-            _format_symbols_search(console, data)
-        elif command == "analyze-symbol":
-            _format_symbol_analysis(console, data, show_code=show_code, show_all_members=show_all_members)
-        elif command == "get-project-details":
-            _format_project_details(console, data)
-        elif command == "show-diagnostics":
-            _format_diagnostics(console, data)
-        else:
-            # Fallback to JSON
-            syntax = Syntax(json.dumps(data, indent=2), "json", theme="monokai")
-            console.print(syntax)
-            
-    except Exception as e:
-        console.print(f"[red]Error formatting output: {e}[/red]")
-        _format_simple_output(response)
-
-
-def _format_index_status(console, index_status: Dict) -> None:
-    """Format and display indexing status information with ETA"""
-    if not index_status:
-        return
-    
-    in_progress = index_status.get("in_progress", False)
-    progress_percentage = index_status.get("progress_percentage")
-    indexed_files = index_status.get("indexed_files", 0)
-    total_files = index_status.get("total_files", 0)
-    estimated_time_remaining = index_status.get("estimated_time_remaining")
-    state = index_status.get("state", "Unknown")
-    
-    # Helper function to format duration
-    def format_duration(duration_dict):
-        if not duration_dict or not isinstance(duration_dict, dict):
-            return "unknown"
-        
-        secs = duration_dict.get("secs", 0)
-        if secs < 60:
-            return f"{secs} seconds"
-        elif secs < 3600:
-            minutes = secs // 60
-            remaining_secs = secs % 60
-            if remaining_secs == 0:
-                return f"{minutes} minute{'s' if minutes != 1 else ''}"
-            else:
-                return f"{minutes} minute{'s' if minutes != 1 else ''} {remaining_secs} second{'s' if remaining_secs != 1 else ''}"
-        else:
-            hours = secs // 3600
-            minutes = (secs % 3600) // 60
-            if minutes == 0:
-                return f"{hours} hour{'s' if hours != 1 else ''}"
-            else:
-                return f"{hours} hour{'s' if hours != 1 else ''} {minutes} minute{'s' if minutes != 1 else ''}"
-    
-    # Determine color based on state
-    if in_progress:
-        status_color = "yellow"
-        status_icon = "⚡"
-        title_text = "Indexing in progress"
-    elif "Completed" in state:
-        status_color = "green"
-        status_icon = "✓"
-        title_text = "Indexing completed"
-    elif "Partial" in state:
-        status_color = "orange"
-        status_icon = "⚠"
-        title_text = "Indexing partial/timeout"
-    else:
-        status_color = "blue"
-        status_icon = "ℹ"
-        title_text = "Indexing status"
-    
-    # Build the status display
-    status_lines = [f"[{status_color}]{status_icon} {title_text}[/{status_color}]"]
-    
-    # Progress bar and percentage
-    if progress_percentage is not None and total_files > 0:
-        progress = progress_percentage / 100.0
-        bar_width = 20
-        filled = int(bar_width * progress)
-        bar = "█" * filled + "░" * (bar_width - filled)
-        status_lines.append(f"Progress: [{status_color}][{bar}] {progress_percentage:.1f}%[/{status_color}]")
-    
-    # Files count
-    if total_files > 0:
-        status_lines.append(f"Files: [bold]{indexed_files}/{total_files}[/bold]")
-    
-    # ETA
-    if estimated_time_remaining and in_progress:
-        eta_text = format_duration(estimated_time_remaining)
-        status_lines.append(f"ETA: [cyan]{eta_text}[/cyan]")
-    
-    # State
-    status_lines.append(f"State: [dim]{state}[/dim]")
-    
-    # Create and display the panel
-    panel_content = "\n".join(status_lines)
-    panel = Panel(panel_content, title="Indexing Status", border_style=status_color, padding=(0, 1))
-    console.print(panel)
-    console.print()
-
-
-def _format_diagnostics(console, data: Dict) -> None:
-    """Format show-diagnostics results"""
-    if not data.get("success", False):
-        console.print(f"[red]Diagnostics failed: {data.get('error', 'Unknown error')}[/red]")
-        return
-
-    file = data.get("file", "Unknown")
-    errors = data.get("errors", 0)
-    warnings = data.get("warnings", 0)
-    notes = data.get("notes", 0)
-    timed_out = data.get("timed_out", False)
-    diags = data.get("diagnostics", [])
-
-    title_color = "green" if (errors == 0 and warnings == 0) else ("red" if errors > 0 else "yellow")
-    title = f"Diagnostics for '[bold cyan]{file}[/bold cyan]'"
-    summary = f"[bold]{errors}[/bold] error(s), [bold]{warnings}[/bold] warning(s), [bold]{notes}[/bold] note(s)"
-
-    if timed_out:
-        console.print(Panel(
-            f"{summary}\n[yellow]⚠ clangd did not publish diagnostics within the timeout. "
-            f"Try increasing --wait-timeout or check the build directory.[/yellow]",
-            title=title, border_style="yellow", padding=(0, 1)))
-        return
-
-    if not diags:
-        console.print(Panel(
-            "[green]✓ No diagnostics reported - file appears clean.[/green]\n" + summary,
-            title=title, border_style="green", padding=(0, 1)
-        ))
-        return
-
-    console.print(Panel(summary, title=title, border_style=title_color, padding=(0, 1)))
-
-    _DIAG_SEVERITIES = {1: "ERROR", 2: "WARNING", 3: "INFORMATION", 4: "HINT"}
-
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Severity", style="cyan", width=12)
-    table.add_column("Location", style="white", width=24)
-    table.add_column("Message", style="white")
-    table.add_column("Source", style="dim", width=12)
-
-    for d in diags:
-        sev_raw = d.get("severity")
-        sev = _DIAG_SEVERITIES.get(sev_raw, str(sev_raw)) if sev_raw is not None else "UNKNOWN"
-        sev_color = {"ERROR": "red", "WARNING": "yellow", "INFORMATION": "blue", "HINT": "magenta"}.get(sev, "white")
-        sev_display = f"[{sev_color}]{sev}[/{sev_color}]"
-
-        # Build location string: line:character (1-based) 
-        rng = d.get("range", {})
-        start = rng.get("start", {})
-        line = (start.get("line", 0) or 0) + 1
-        char = (start.get("character", 0) or 0) + 1
-        loc = f":{line}:{char}"
-        message = d.get("message", "")
-        source = d.get("source") or ""
-
-        table.add_row(sev_display, loc, message, source)
-
-    console.print(table)
-
-    # Optionally show related information
-    for d in diags:
-        related = d.get("related_information")
-        if related:
-            console.print(f"[dim]Related info for '{d.get('message', '')}':[/dim]")
-            for ri in related:
-                rloc = ri.get("location", {})
-                rstart = rloc.get("range", {}).get("start", {})
-                rline = (rstart.get("line", 0) or 0) + 1
-                rmsg = ri.get("message", "")
-                console.print(f"  [dim]at {rloc.get('uri', '')}:{rline}[/dim] {rmsg}")
-
-    # Index status footer
-    index_status = data.get("index_status")
-    if index_status:
-        console.print()
-        _format_index_status(console, index_status)
-
-
-def _format_symbols_search(console, data: Dict) -> None:
-    """Format symbol search results"""
-    if not data.get("success", False):
-        console.print(f"[red]Search failed: {data.get('error', 'Unknown error')}[/red]")
-        return
-        
-    query = data.get("query", "Unknown")
-    symbols = data.get("symbols", [])
-    total_matches = data.get("total_matches", len(symbols))  # Fixed: use total_matches instead of total_found
-    metadata = data.get("metadata", {})
-    
-    # Panel header similar to analyze_symbol
-    console.print(Panel(f"[bold cyan]Search Results for '[yellow]{query}[/yellow]'[/bold cyan]", 
-                       title="Symbol Search Results", border_style="blue"))
-    
-    # Display metadata information
-    search_type = metadata.get("search_type", "unknown")
-    build_dir = metadata.get("build_directory", "")
-    if build_dir:
-        console.print(f"[bold]Build Directory:[/bold] {build_dir}")
-    console.print(f"[bold]Search Type:[/bold] {search_type}")
-    console.print(f"[bold]Results:[/bold] Found {total_matches} symbols (showing {len(symbols)})")
-    console.print()
-    
-    # Display index status if available
-    index_status = data.get("index_status")
-    if index_status:
-        _format_index_status(console, index_status)
-    
-    if not symbols:
-        console.print("[yellow]No symbols found[/yellow]")
-        return
-    
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Symbol", style="cyan", width=25)
-    table.add_column("Kind", style="blue", width=12)
-    table.add_column("Location", style="green", width=25)
-    table.add_column("Container", style="yellow", width=25)
-    
-    for symbol in symbols:
-        name = symbol.get("name", "Unknown")
-        kind = symbol.get("kind", "unknown")
-        
-        # Convert LSP symbol kind number to readable string if needed
-        if isinstance(kind, int):
-            kind_names = {
-                1: "File", 2: "Module", 3: "Namespace", 4: "Package", 5: "Class",
-                6: "Method", 7: "Property", 8: "Field", 9: "Constructor", 10: "Enum",
-                11: "Interface", 12: "Function", 13: "Variable", 14: "Constant",
-                15: "String", 16: "Number", 17: "Boolean", 18: "Array", 19: "Object",
-                20: "Key", 21: "Null", 22: "EnumMember", 23: "Struct", 24: "Event",
-                25: "Operator", 26: "TypeParameter"
-            }
-            kind = kind_names.get(kind, f"Unknown({kind})")
-        
-        # Format location - handle FileLocation string format
-        location = "Unknown"
-        if "location" in symbol:
-            loc = symbol["location"]
-            if isinstance(loc, str):
-                # Handle FileLocation string format: /path/file.cpp:18:7-11
-                try:
-                    # Extract just the filename and line number
-                    if ':' in loc:
-                        parts = loc.rsplit(':', 2)  # Split from right to handle paths with colons
-                        if len(parts) >= 2:
-                            file_path = Path(parts[0]).name  # Just filename
-                            line_num = parts[1]
-                            location = f"{file_path}:{line_num}"
-                        else:
-                            location = Path(loc).name
-                    else:
-                        location = Path(loc).name
-                except Exception:
-                    location = str(loc)
-            elif isinstance(loc, dict):
-                # Handle LSP Location object format (legacy support)
-                file_uri = loc.get("uri", "")
-                if file_uri.startswith("file://"):
-                    file_path = Path(file_uri[7:]).name  # Just filename
-                else:
-                    file_path = file_uri
-                    
-                if "range" in loc and "start" in loc["range"]:
-                    line = loc["range"]["start"].get("line", 0) + 1  # Convert to 1-based
-                    location = f"{file_path}:{line}"
-                else:
-                    location = file_path
-        
-        container = symbol.get("container_name", "")
-        
-        table.add_row(name, kind, location, container)
-    
-    console.print(table)
-
-
-def extract_code_from_location(location_str: str) -> Dict[str, Union[str, int]]:
-    """Extract code snippet from FileLocation string format.
-    
-    Args:
-        location_str: Format like "/path/to/file.cpp:18:7-11" 
-                     (file:line:start_col-end_col)
-    
-    Returns:
-        Dict with 'code', 'line_number', 'file_path', 'error' keys
-    """
-    try:
-        # Parse the location format: /path/to/file.cpp:18:7-11
-        if ':' not in location_str:
-            return {"error": "Invalid location format", "code": "", "line_number": 0, "file_path": ""}
-            
-        parts = location_str.rsplit(':', 2)  # Split from right to handle paths with colons
-        if len(parts) < 3:
-            return {"error": "Invalid location format", "code": "", "line_number": 0, "file_path": ""}
-            
-        file_path = parts[0]
-        line_part = parts[1]
-        col_part = parts[2]
-        
-        # Extract line number
-        try:
-            line_num = int(line_part)
-        except ValueError:
-            return {"error": "Invalid line number", "code": "", "line_number": 0, "file_path": file_path}
-        
-        # Try to read the file and extract the line
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-                
-            if line_num <= 0 or line_num > len(lines):
-                return {"error": f"Line {line_num} out of range", "code": "", "line_number": line_num, "file_path": file_path}
-                
-            # Get the line (convert from 1-based to 0-based indexing)
-            code_line = lines[line_num - 1].rstrip('\n\r')
-            
-            return {
-                "code": code_line,
-                "line_number": line_num,
-                "file_path": file_path,
-                "error": None
-            }
-            
-        except FileNotFoundError:
-            return {"error": "File not found", "code": "", "line_number": line_num, "file_path": file_path}
-        except PermissionError:
-            return {"error": "Permission denied", "code": "", "line_number": line_num, "file_path": file_path}
-        except Exception as e:
-            return {"error": f"Error reading file: {e}", "code": "", "line_number": line_num, "file_path": file_path}
-            
-    except Exception as e:
-        return {"error": f"Error parsing location: {e}", "code": "", "line_number": 0, "file_path": ""}
-
-
-def _format_symbol_analysis(console, data: Dict, show_code: bool = True, show_all_members: bool = False) -> None:
-    """Format symbol analysis results from AnalyzerResult structure"""
-    
-    # Extract data from AnalyzerResult structure
-    symbol_data = data.get("symbol", {})
-    query = data.get("query", "Unknown")
-    definitions = data.get("definitions", [])
-    declarations = data.get("declarations", [])
-    hover_doc = data.get("hover_documentation")
-    detail = data.get("detail")
-    examples = data.get("examples", [])
-    type_hierarchy = data.get("type_hierarchy")
-    call_hierarchy = data.get("call_hierarchy")
-    members = data.get("members")
-    
-    symbol_name = symbol_data.get("name", query)
-    
-    console.print(Panel(f"[bold cyan]Symbol Analysis: {symbol_name}[/bold cyan]", 
-                       title="Symbol Information", border_style="blue"))
-    
-    # Basic symbol information
-    if symbol_data:
-        kind = symbol_data.get("kind")
-        if kind:
-            # Convert LSP symbol kind number to readable string if needed
-            if isinstance(kind, int):
-                kind_names = {
-                    1: "File", 2: "Module", 3: "Namespace", 4: "Package", 5: "Class",
-                    6: "Method", 7: "Property", 8: "Field", 9: "Constructor", 10: "Enum",
-                    11: "Interface", 12: "Function", 13: "Variable", 14: "Constant",
-                    15: "String", 16: "Number", 17: "Boolean", 18: "Array", 19: "Object",
-                    20: "Key", 21: "Null", 22: "EnumMember", 23: "Struct", 24: "Event",
-                    25: "Operator", 26: "TypeParameter"
-                }
-                kind = kind_names.get(kind, f"Unknown({kind})")
-            console.print(f"[bold]Kind:[/bold] {kind}")
-        
-        fully_qualified_name = symbol_data.get("fully_qualified_name")
-        if fully_qualified_name:
-            console.print(f"[bold]Fully Qualified Name:[/bold] {fully_qualified_name}")
-    
-    # Show detail if available
-    if detail:
-        console.print(f"[bold]Detail:[/bold] {detail}")
-    
-    console.print()
-    
-    # Display index status if available
-    index_status = data.get("index_status")
-    if index_status:
-        _format_index_status(console, index_status)
-    
-    # Helper to format location with code snippet
-    def format_location_with_code(location_str, show_code_snippet=True):
-        """Format FileLocation with optional code snippet"""
-        if not show_code_snippet:
-            return location_str
-            
-        code_info = extract_code_from_location(location_str)
-        if code_info["error"]:
-            return f"{location_str} [dim](code unavailable: {code_info['error']})[/dim]"
-        
-        # Format with syntax highlighting
-        code = code_info["code"].strip()
-        if code:
-            # Use a more compact format for definitions/declarations
-            return f"{location_str}\n    [green]→[/green] [cyan]{code}[/cyan]"
-        else:
-            return location_str
-    
-    if definitions:
-        console.print(f"[bold]Definitions ({len(definitions)}):[/bold]")
-        for i, definition in enumerate(definitions[:3]):  # Show first 3
-            formatted = format_location_with_code(definition, show_code)
-            console.print(f"  {i+1}. {formatted}")
-        if len(definitions) > 3:
-            console.print(f"  ... and {len(definitions) - 3} more")
-    
-    if declarations:
-        console.print(f"[bold]Declarations ({len(declarations)}):[/bold]")
-        for i, declaration in enumerate(declarations[:3]):  # Show first 3
-            formatted = format_location_with_code(declaration, show_code)
-            console.print(f"  {i+1}. {formatted}")
-        if len(declarations) > 3:
-            console.print(f"  ... and {len(declarations) - 3} more")
-    
-    # Documentation
-    if hover_doc:
-        console.print(f"\n[bold]Documentation:[/bold]")
-        syntax = Syntax(hover_doc, "markdown", theme="monokai", line_numbers=False)
-        console.print(Panel(syntax, border_style="dim"))
-    
-    # Usage examples
-    if examples:
-        console.print(f"\n[bold green]Usage Examples ({len(examples)}):[/bold green]")
-        for i, example in enumerate(examples[:5], 1):  # Show first 5
-            formatted = format_location_with_code(example, show_code)
-            console.print(f"  {i}. {formatted}")
-        if len(examples) > 5:
-            console.print(f"  ... and {len(examples) - 5} more examples")
-    
-    # Type hierarchy
-    if type_hierarchy:
-        console.print(f"\n[bold green]Type Hierarchy:[/bold green]")
-        
-        supertypes = type_hierarchy.get("supertypes", [])
-        subtypes = type_hierarchy.get("subtypes", [])
-        
-        if supertypes:
-            console.print(f"[bold]Base Types ({len(supertypes)}):[/bold]")
-            for supertype in supertypes[:3]:
-                # Handle both string names and objects
-                if isinstance(supertype, str):
-                    name = supertype
-                else:
-                    name = supertype.get("name", "Unknown")
-                console.print(f"  • [cyan]{name}[/cyan]")
-            if len(supertypes) > 3:
-                console.print(f"  ... and {len(supertypes) - 3} more")
-        
-        if subtypes:
-            console.print(f"[bold]Derived Types ({len(subtypes)}):[/bold]")
-            for subtype in subtypes[:3]:
-                # Handle both string names and objects
-                if isinstance(subtype, str):
-                    name = subtype
-                else:
-                    name = subtype.get("name", "Unknown")
-                console.print(f"  • [cyan]{name}[/cyan]")
-            if len(subtypes) > 3:
-                console.print(f"  ... and {len(subtypes) - 3} more")
-    
-    # Call hierarchy
-    if call_hierarchy:
-        console.print(f"\n[bold green]Call Hierarchy:[/bold green]")
-        
-        callers = call_hierarchy.get("callers", [])
-        callees = call_hierarchy.get("callees", [])
-        
-        if callers:
-            console.print(f"[bold]Callers ({len(callers)}):[/bold]")
-            for caller in callers[:5]:
-                # Handle both string names and objects
-                if isinstance(caller, str):
-                    name = caller
-                else:
-                    name = caller.get("name", "Unknown")
-                console.print(f"  • [cyan]{name}[/cyan]")
-            if len(callers) > 5:
-                console.print(f"  ... and {len(callers) - 5} more")
-        
-        if callees:
-            console.print(f"[bold]Callees ({len(callees)}):[/bold]")
-            for callee in callees[:5]:
-                # Handle both string names and objects
-                if isinstance(callee, str):
-                    name = callee
-                else:
-                    name = callee.get("name", "Unknown")
-                console.print(f"  • [cyan]{name}[/cyan]")
-            if len(callees) > 5:
-                console.print(f"  ... and {len(callees) - 5} more")
-    
-    # Members (for classes/structs)
-    if members:
-        total_members = (len(members.get("methods", [])) + 
-                        len(members.get("constructors", [])) + 
-                        len(members.get("destructors", [])) + 
-                        len(members.get("operators", [])))
-        
-        console.print(f"\n[bold green]Class Members ({total_members} total):[/bold green]")
-        
-        # Show methods
-        methods = members.get("methods", [])
-        if methods:
-            console.print(f"[bold]Methods ({len(methods)}):[/bold]")
-            method_limit = len(methods) if show_all_members else 5
-            for method in methods[:method_limit]:
-                name = method.get("name", "Unknown")
-                signature = method.get("signature", "")
-                console.print(f"  • [cyan]{name}[/cyan] {signature}")
-            if len(methods) > method_limit:
-                console.print(f"  ... and {len(methods) - method_limit} more methods")
-        
-        # Show constructors
-        constructors = members.get("constructors", [])
-        if constructors:
-            console.print(f"[bold]Constructors ({len(constructors)}):[/bold]")
-            constructor_limit = len(constructors) if show_all_members else 3
-            for constructor in constructors[:constructor_limit]:
-                signature = constructor.get("signature", "")
-                console.print(f"  • [cyan]{symbol_name}[/cyan] {signature}")
-            if len(constructors) > constructor_limit:
-                console.print(f"  ... and {len(constructors) - constructor_limit} more constructors")
-        
-        # Show destructors
-        destructors = members.get("destructors", [])
-        if destructors:
-            console.print(f"[bold]Destructors ({len(destructors)}):[/bold]")
-            for destructor in destructors:
-                signature = destructor.get("signature", "")
-                console.print(f"  • [cyan]~{symbol_name}[/cyan] {signature}")
-        
-        # Show operators
-        operators = members.get("operators", [])
-        if operators:
-            console.print(f"[bold]Operators ({len(operators)}):[/bold]")
-            operator_limit = len(operators) if show_all_members else 3
-            for operator in operators[:operator_limit]:
-                name = operator.get("name", "Unknown")
-                signature = operator.get("signature", "")
-                console.print(f"  • [cyan]{name}[/cyan] {signature}")
-            if len(operators) > operator_limit:
-                console.print(f"  ... and {len(operators) - operator_limit} more operators")
-
-
-def _format_project_details(console, data: Dict) -> None:
-    """Format comprehensive project details including components and global configuration"""
-    project_root_path = data.get("project_root_path", "Unknown")
-    global_compilation_db = data.get("global_compilation_database_path")
-    components = data.get("components", [])
-    scan_depth = data.get("scan_depth", 0)
-    discovered_at = data.get("discovered_at", "Unknown")
-    rescanned = data.get("rescanned", False)
-    
-    # Compute values client-side
-    project_name = "Unknown"
-    if project_root_path != "Unknown":
-        import os
-        project_name = os.path.basename(str(project_root_path)) or "Unknown"
-    
-    component_count = len(components)
-    
-    # Extract unique provider types from components
-    provider_types = []
-    if components:
-        provider_set = set(comp.get("provider_type", "unknown") for comp in components)
-        provider_types = sorted(list(provider_set))
-    
-    # Project header with multi-provider info
-    if project_name != "Unknown":
-        providers_text = f" • {', '.join(provider_types)}" if provider_types else ""
-        console.print(Panel(f"[bold cyan]Project: {project_name}[/bold cyan]{providers_text}", 
-                           title="Project Details Analysis", border_style="blue"))
-        
-        if project_root_path != "Unknown":
-            console.print(f"[bold]Project Root:[/bold] {project_root_path}")
-        
-        # Display global compilation database if configured
-        if global_compilation_db:
-            console.print(f"[bold]Global Compilation DB:[/bold] [green]{global_compilation_db}[/green]")
-        else:
-            console.print(f"[bold]Global Compilation DB:[/bold] [dim]Not configured (using component-specific databases)[/dim]")
-            
-        console.print(f"[bold]Scan Depth:[/bold] {scan_depth} levels")
-        scan_status = " (fresh scan)" if rescanned else " (cached)"
-        console.print(f"[bold]Discovered:[/bold] {discovered_at}{scan_status}")
-        console.print()
-    
-    # Component summary
-    if component_count == 0:
-        console.print("[yellow]No project components found[/yellow]")
-        console.print("This directory may not contain any supported build system configurations.")
-        return
-        
-    console.print(f"[bold green]Found {component_count} project component{'s' if component_count != 1 else ''}:[/bold green]")
-    console.print(f"[dim]Provider types: {', '.join(provider_types)}[/dim]")
-    console.print()
-    
-    # Group components by provider type
-    components_by_provider = {}
-    for component in components:
-        provider = component.get("provider_type", "unknown")
-        if provider not in components_by_provider:
-            components_by_provider[provider] = []
-        components_by_provider[provider].append(component)
-    
-    # Display components grouped by provider
-    for provider_type, provider_components in components_by_provider.items():
-        provider_icon = "🔨" if provider_type == "cmake" else "⚡" if provider_type == "meson" else "🔧"
-        console.print(f"[bold yellow]{provider_icon} {provider_type.upper()} Components ({len(provider_components)}):[/bold yellow]")
-        
-        for i, component in enumerate(provider_components, 1):
-            build_path = component.get("build_dir_path", "Unknown")
-            source_path = component.get("source_root_path", "Unknown")
-            generator = component.get("generator", "Unknown")
-            build_type = component.get("build_type", "Unknown")
-            
-            console.print(f"  [bold cyan]{i}. {build_path}[/bold cyan]")
-            
-            if source_path != "Unknown":
-                console.print(f"     Source Root: {source_path}")
-            if generator != "Unknown":
-                console.print(f"     Generator: {generator}")
-            if build_type != "Unknown":
-                console.print(f"     Build Type: {build_type}")
-            
-            # Check if compilation database exists
-            compile_db_path = component.get("compilation_database_path", "")
-            if compile_db_path:
-                console.print(f"     Compile DB: ✓ {compile_db_path}")
-            else:
-                console.print(f"     Compile DB: ✗ Not found")
-            
-            # Show build options if available (limit to important ones)
-            build_options = component.get("build_options", {})
-            if build_options:
-                important_options = {k: v for k, v in build_options.items() 
-                                   if not k.endswith(("_BINARY_DIR", "_SOURCE_DIR")) and len(str(v)) < 100}
-                if important_options:
-                    console.print("     [dim]Build Options:[/dim]")
-                    for key, value in list(important_options.items())[:5]:  # Limit to 5 options
-                        console.print(f"       {key}: {value}")
-                    if len(important_options) > 5:
-                        console.print(f"       ... and {len(important_options) - 5} more")
-            
-            console.print()
-        
-        console.print()
+        # A bug in the CLI, not a server-reported problem. --debug shows where.
+        if args.debug:
+            raise
+        print(f"internal error: {type(e).__name__}: {e}", file=sys.stderr)
+        print("re-run with --debug for a traceback", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

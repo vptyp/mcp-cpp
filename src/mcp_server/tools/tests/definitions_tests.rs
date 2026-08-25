@@ -28,8 +28,14 @@ async fn test_definitions_class_symbol() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Complete indexing using ComponentSession prior to session operations
     let component_session = workspace_session
@@ -87,8 +93,14 @@ async fn test_declarations_class_symbol() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Complete indexing using ComponentSession prior to session operations
     let component_session = workspace_session
@@ -146,8 +158,14 @@ async fn test_definitions_function_symbol() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Complete indexing using ComponentSession prior to session operations
     let component_session = workspace_session
@@ -214,8 +232,14 @@ async fn test_definitions_method_symbol() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Complete indexing using ComponentSession prior to session operations
     let component_session = workspace_session

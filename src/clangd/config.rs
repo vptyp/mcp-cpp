@@ -19,11 +19,16 @@ use crate::clangd::error::ClangdConfigError;
 /// and complete initial indexing of small to medium projects.
 pub const DEFAULT_INITIALIZATION_TIMEOUT_SECS: u64 = 30;
 
-/// Default timeout for individual LSP requests (10 seconds)
+/// Default timeout for individual LSP requests (30 seconds)
 ///
-/// Most LSP requests should complete quickly, but symbol queries in large
-/// codebases may take several seconds.
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
+/// Most LSP requests should complete quickly, but symbol queries, call hierarchies
+/// and reference searches in large codebases may take tens of seconds.
+///
+/// This was previously documented as 10 seconds while the transport ignored the
+/// setting entirely and always used a hardcoded 30. 30 is therefore the value the
+/// server has actually been running with, and lowering it now would introduce
+/// timeouts on exactly the large trees this project targets.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum allowed initialization timeout (5 minutes)
 ///
@@ -31,17 +36,14 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// the application. Large projects should complete indexing within this limit.
 pub const MAX_INITIALIZATION_TIMEOUT_SECS: u64 = 300;
 
-/// Memory limit conversion factor (MB to result count)
-///
-/// Rough heuristic to convert memory limit in MB to clangd's --limit-results
-/// parameter. This is an approximation based on typical symbol sizes.
-pub const MEMORY_TO_RESULTS_FACTOR: u64 = 1000;
-
 /// Default workspace symbol limit for clangd
 ///
 /// Clangd's default workspace symbol limit is 100 results. We increase this to 1000
 /// to provide better search coverage for large C++ codebases while maintaining
 /// reasonable performance. This is applied via the --limit-results clangd argument.
+///
+/// Note this is a *result count*, not a memory budget. clangd has no flag that
+/// caps its memory use, so there is nothing for a megabyte figure to control.
 pub const DEFAULT_WORKSPACE_SYMBOL_LIMIT: u32 = 1000;
 
 /// Default timeout for waiting for indexing completion (20 seconds)
@@ -125,8 +127,11 @@ pub struct ResourceConfig {
     /// Stderr log file path (optional)
     pub stderr_log_path: Option<PathBuf>,
 
-    /// Maximum memory usage hint for clangd
-    pub max_memory_mb: Option<u64>,
+    /// Maximum number of results clangd returns for a workspace symbol query.
+    ///
+    /// Emitted as `--limit-results`. Kept deliberately high; the user-facing
+    /// `max_results` is applied client-side so clangd's ranking is preserved.
+    pub workspace_symbol_limit: u32,
 
     /// Process priority setting
     pub process_priority: ProcessPriority,
@@ -206,7 +211,7 @@ pub struct LspConfigBuilder {
 #[derive(Debug, Default)]
 pub struct ResourceConfigBuilder {
     stderr_log_path: Option<PathBuf>,
-    max_memory_mb: Option<u64>,
+    workspace_symbol_limit: Option<u32>,
     process_priority: Option<ProcessPriority>,
     background_indexing: Option<bool>,
     pch_storage: Option<PchStorage>,
@@ -235,7 +240,7 @@ impl Default for ResourceConfig {
     fn default() -> Self {
         Self {
             stderr_log_path: None,
-            max_memory_mb: None,
+            workspace_symbol_limit: DEFAULT_WORKSPACE_SYMBOL_LIMIT,
             process_priority: ProcessPriority::Normal,
             background_indexing: true,
             pch_storage: PchStorage::Memory,
@@ -345,9 +350,10 @@ impl ClangdConfigBuilder {
         self
     }
 
-    /// Set the maximum memory usage hint
-    pub fn max_memory_mb(mut self, memory_mb: u64) -> Self {
-        self.resource_config.max_memory_mb = Some(memory_mb);
+    /// Set the cap on workspace-symbol results returned by clangd (`--limit-results`)
+    #[allow(dead_code)]
+    pub fn workspace_symbol_limit(mut self, limit: u32) -> Self {
+        self.resource_config.workspace_symbol_limit = Some(limit);
         self
     }
 
@@ -577,7 +583,9 @@ impl ResourceConfigBuilder {
 
         ResourceConfig {
             stderr_log_path: self.stderr_log_path,
-            max_memory_mb: self.max_memory_mb,
+            workspace_symbol_limit: self
+                .workspace_symbol_limit
+                .unwrap_or(default.workspace_symbol_limit),
             process_priority: self.process_priority.unwrap_or(default.process_priority),
             background_indexing: self
                 .background_indexing
@@ -600,27 +608,59 @@ impl Default for ClangdConfigBuilder {
 // ============================================================================
 
 impl ClangdConfig {
+    /// Directory passed to clangd via `--compile-commands-dir`.
+    ///
+    /// Point clangd at the project root when a compile_commands.json is reachable
+    /// there (e.g. Chromium's `src/compile_commands.json -> out/chrome/...` symlink).
+    /// This makes clangd's project root (and therefore its index cache) the project
+    /// root rather than the build dir, so it reuses any existing `.cache/clangd/index`
+    /// instead of reindexing from scratch. Fall back to the build dir when the root
+    /// has no discoverable database.
+    ///
+    /// This is the single source of truth for the layout decision: everything that
+    /// needs to know where clangd reads its database or writes its index must go
+    /// through this function or [`index_directory`](Self::index_directory), never
+    /// re-derive it. The two answers diverge exactly in the root-database layout,
+    /// and a second derivation that guesses "build dir" there silently reads an
+    /// index directory clangd never writes to.
+    pub fn resolve_compile_commands_dir(
+        working_directory: &Path,
+        build_directory: &Path,
+    ) -> PathBuf {
+        if working_directory.join("compile_commands.json").exists() {
+            working_directory.to_path_buf()
+        } else {
+            build_directory.to_path_buf()
+        }
+    }
+
+    /// Directory clangd writes its on-disk index shards to.
+    ///
+    /// clangd anchors `.cache/clangd/index` at the compilation-database directory,
+    /// so this must be derived from [`resolve_compile_commands_dir`](Self::resolve_compile_commands_dir)
+    /// rather than from the build directory.
+    pub fn resolve_index_directory(working_directory: &Path, build_directory: &Path) -> PathBuf {
+        Self::resolve_compile_commands_dir(working_directory, build_directory)
+            .join(".cache")
+            .join("clangd")
+            .join("index")
+    }
+
+    /// Directory this configuration passes to clangd via `--compile-commands-dir`.
+    pub fn compile_commands_dir(&self) -> PathBuf {
+        Self::resolve_compile_commands_dir(&self.working_directory, &self.build_directory)
+    }
+
+    /// Directory clangd will write its index shards to under this configuration.
+    pub fn index_directory(&self) -> PathBuf {
+        Self::resolve_index_directory(&self.working_directory, &self.build_directory)
+    }
+
     /// Get the full command-line arguments for clangd
     pub fn get_clangd_args(&self) -> Vec<String> {
-        // Point clangd at the project root when a compile_commands.json is reachable
-        // there (e.g. Chromium's `src/compile_commands.json -> out/chrome/...` symlink).
-        // This makes clangd's project root (and therefore its index cache) the project
-        // root rather than the build dir, so it reuses any existing `.cache/clangd/index`
-        // instead of reindexing from scratch. Fall back to the build dir when the root
-        // has no discoverable database.
-        let compile_commands_dir = if self
-            .working_directory
-            .join("compile_commands.json")
-            .exists()
-        {
-            self.working_directory.clone()
-        } else {
-            self.build_directory.clone()
-        };
-
         let mut args = vec![
             "--compile-commands-dir".to_string(),
-            compile_commands_dir.to_string_lossy().to_string(),
+            self.compile_commands_dir().to_string_lossy().to_string(),
         ];
 
         // Add background indexing control (explicitly enabled, not relying on clangd default)
@@ -650,13 +690,14 @@ impl ClangdConfig {
             args.push(index_threads.to_string());
         }
 
-        // Add memory limit if specified
-        if let Some(memory_mb) = self.resource_config.max_memory_mb {
-            args.push(format!(
-                "--limit-results={}",
-                memory_mb * MEMORY_TO_RESULTS_FACTOR
-            ));
-        }
+        // Cap on workspace-symbol results returned by clangd. Emitted here, once,
+        // so there is a single place that decides it; callers must not append their
+        // own --limit-results, since clangd takes the last occurrence and a second
+        // one silently overrides this.
+        args.push(format!(
+            "--limit-results={}",
+            self.resource_config.workspace_symbol_limit
+        ));
 
         // Add extra arguments
         args.extend(self.extra_args.clone());
@@ -706,7 +747,7 @@ mod tests {
             .root_uri("file:///test/project")
             .initialization_timeout(Duration::from_secs(60))
             .verbose_tracing(true)
-            .max_memory_mb(2048)
+            .workspace_symbol_limit(2048)
             .process_priority(ProcessPriority::High)
             .build()
             .unwrap();
@@ -722,7 +763,7 @@ mod tests {
             Duration::from_secs(60)
         );
         assert!(config.lsp_config.verbose_tracing);
-        assert_eq!(config.resource_config.max_memory_mb, Some(2048));
+        assert_eq!(config.resource_config.workspace_symbol_limit, 2048);
         assert_eq!(
             config.resource_config.process_priority,
             ProcessPriority::High
@@ -769,7 +810,7 @@ mod tests {
             .working_directory(temp_dir.path())
             .build_directory(&build_dir)
             .add_arg("--log=verbose")
-            .max_memory_mb(1024)
+            .workspace_symbol_limit(1024)
             .background_indexing(false)
             .build()
             .unwrap();
@@ -779,7 +820,7 @@ mod tests {
         assert!(args.contains(&build_dir.to_string_lossy().to_string()));
         assert!(args.contains(&"--background-index=false".to_string()));
         assert!(args.contains(&"--log=verbose".to_string()));
-        assert!(args.iter().any(|arg| arg.starts_with("--limit-results=")));
+        assert!(args.contains(&"--limit-results=1024".to_string()));
     }
 
     #[test]
@@ -846,6 +887,55 @@ mod tests {
         assert!(!args.contains(&build_dir.to_string_lossy().to_string()));
     }
 
+    /// The index directory must track `--compile-commands-dir`, not the build dir.
+    ///
+    /// These two answers are identical in the ordinary layout and diverge only when
+    /// the project root carries its own `compile_commands.json`. That divergence is
+    /// exactly the bug this pins: a second derivation that assumes "build dir" would
+    /// point the index reader at a directory clangd never writes to, so every shard
+    /// looks missing and the whole component reports as unindexed forever.
+    #[test]
+    fn test_index_directory_follows_compile_commands_dir() {
+        let temp_dir = tempdir().unwrap();
+        let root = temp_dir.path();
+        let build_dir = root.join("build");
+        std::fs::create_dir(&build_dir).unwrap();
+        std::fs::write(build_dir.join("compile_commands.json"), "[]").unwrap();
+
+        let cache_suffix = Path::new(".cache").join("clangd").join("index");
+
+        // Build-directory layout: index lands under the build dir.
+        let config = ClangdConfigBuilder::new()
+            .working_directory(root)
+            .build_directory(&build_dir)
+            .build()
+            .unwrap();
+        assert_eq!(config.compile_commands_dir(), build_dir);
+        assert_eq!(config.index_directory(), build_dir.join(&cache_suffix));
+
+        // Root-database layout: index must follow the root, not the build dir.
+        std::fs::write(root.join("compile_commands.json"), "[]").unwrap();
+        let config = ClangdConfigBuilder::new()
+            .working_directory(root)
+            .build_directory(&build_dir)
+            .build()
+            .unwrap();
+        assert_eq!(config.compile_commands_dir(), root);
+        assert_eq!(config.index_directory(), root.join(&cache_suffix));
+        assert_ne!(config.index_directory(), build_dir.join(&cache_suffix));
+
+        // And the directory we hand the index reader is the one we handed clangd.
+        let args = config.get_clangd_args();
+        let flag = args
+            .iter()
+            .position(|a| a == "--compile-commands-dir")
+            .unwrap();
+        assert_eq!(
+            config.index_directory(),
+            Path::new(&args[flag + 1]).join(&cache_suffix)
+        );
+    }
+
     #[test]
     fn test_root_uri_auto_generation() {
         let temp_dir = tempdir().unwrap();
@@ -862,5 +952,113 @@ mod tests {
         let root_uri = config.get_root_uri().unwrap();
         assert!(root_uri.starts_with("file://"));
         assert!(root_uri.contains(&temp_dir.path().to_string_lossy().to_string()));
+    }
+
+    /// Full argv, in order, with every machine-dependent input pinned.
+    ///
+    /// `get_clangd_args` decides both what clangd is told and, through
+    /// `--compile-commands-dir`, where clangd writes its index. Pinning the
+    /// exact sequence means a refactor that reorders or drops a flag fails
+    /// here rather than silently changing clangd's behaviour.
+    #[test]
+    fn test_clangd_args_exact_snapshot() {
+        let temp_dir = tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build");
+        std::fs::create_dir(&build_dir).unwrap();
+        std::fs::write(build_dir.join("compile_commands.json"), "[]").unwrap();
+
+        let config = ClangdConfigBuilder::new()
+            .working_directory(temp_dir.path())
+            .build_directory(&build_dir)
+            .index_threads(4)
+            .add_arg("--log=verbose")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            config.get_clangd_args(),
+            vec![
+                "--compile-commands-dir".to_string(),
+                build_dir.to_string_lossy().to_string(),
+                "--background-index".to_string(),
+                "--pch-storage=memory".to_string(),
+                "-j".to_string(),
+                "4".to_string(),
+                "--limit-results=1000".to_string(),
+                "--log=verbose".to_string(),
+            ]
+        );
+    }
+
+    /// Same, for the layout where the project root carries the database.
+    #[test]
+    fn test_clangd_args_exact_snapshot_root_database() {
+        let temp_dir = tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build");
+        std::fs::create_dir(&build_dir).unwrap();
+        std::fs::write(build_dir.join("compile_commands.json"), "[]").unwrap();
+        std::fs::write(temp_dir.path().join("compile_commands.json"), "[]").unwrap();
+
+        let config = ClangdConfigBuilder::new()
+            .working_directory(temp_dir.path())
+            .build_directory(&build_dir)
+            .index_threads(2)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            config.get_clangd_args(),
+            vec![
+                "--compile-commands-dir".to_string(),
+                temp_dir.path().to_string_lossy().to_string(),
+                "--background-index".to_string(),
+                "--pch-storage=memory".to_string(),
+                "-j".to_string(),
+                "2".to_string(),
+                "--limit-results=1000".to_string(),
+            ]
+        );
+    }
+
+    /// Collect the flag names in an argv, so a caller can check for repeats.
+    /// A flag is anything starting with '-'; "--flag=value" counts as "--flag".
+    fn flag_names(args: &[String]) -> Vec<&str> {
+        args.iter()
+            .filter(|a| a.starts_with('-'))
+            .map(|a| a.split('=').next().unwrap())
+            .collect()
+    }
+
+    /// clangd takes the last occurrence of a repeated flag, so a duplicate is
+    /// a silent override rather than an error. Catch it here instead.
+    #[test]
+    fn test_clangd_args_have_no_duplicate_flags() {
+        let temp_dir = tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build");
+        std::fs::create_dir(&build_dir).unwrap();
+        std::fs::write(build_dir.join("compile_commands.json"), "[]").unwrap();
+
+        let config = ClangdConfigBuilder::new()
+            .working_directory(temp_dir.path())
+            .build_directory(&build_dir)
+            .index_threads(4)
+            .build()
+            .unwrap();
+
+        let args = config.get_clangd_args();
+        let mut names = flag_names(&args);
+        names.sort_unstable();
+        let mut unique = names.clone();
+        unique.dedup();
+        assert_eq!(names, unique, "duplicate clangd flag in {args:?}");
+
+        // --limit-results in particular used to be emitted twice: once here from
+        // max_memory_mb (a megabyte figure fed to a result-count flag) and once
+        // more by the session builder. Whichever came last won.
+        assert_eq!(
+            names.iter().filter(|n| **n == "--limit-results").count(),
+            1,
+            "--limit-results must be emitted exactly once, got {args:?}"
+        );
     }
 }

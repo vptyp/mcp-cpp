@@ -36,6 +36,13 @@ pub struct IndexStatusView {
 
     /// Human-readable state description
     pub state: String,
+
+    /// True while the reconciling disk scan is still running, meaning the counts
+    /// above are provisional and may understate what is already indexed.
+    ///
+    /// Omitted once the scan has finished, which is the steady state.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub scan_in_progress: bool,
 }
 
 impl IndexStatusView {
@@ -47,6 +54,7 @@ impl IndexStatusView {
         total_files: usize,
         start_time: Option<SystemTime>,
         state: String,
+        scan_in_progress: bool,
     ) -> Self {
         let estimated_time_remaining = Self::calculate_eta(
             progress_percentage,
@@ -64,6 +72,7 @@ impl IndexStatusView {
             start_time,
             estimated_time_remaining,
             state,
+            scan_in_progress,
         }
     }
 
@@ -158,6 +167,7 @@ mod tests {
             20,
             Some(now),
             "InProgress".to_string(),
+            false,
         );
 
         assert!(view.in_progress);
@@ -180,6 +190,7 @@ mod tests {
             20,
             Some(now),
             "InProgress".to_string(),
+            false,
         );
 
         // Should not have ETA because we can't divide by zero
@@ -196,6 +207,7 @@ mod tests {
             20,
             Some(now),
             "Completed".to_string(),
+            false,
         );
 
         // Should not have ETA because not in progress
@@ -211,6 +223,7 @@ mod tests {
             20,
             None, // No start time
             "InProgress".to_string(),
+            false,
         );
 
         // Should not have ETA because no start time
@@ -219,20 +232,44 @@ mod tests {
 
     #[test]
     fn test_is_complete() {
-        let view1 = IndexStatusView::new(false, Some(100.0), 20, 20, None, "Completed".to_string());
+        let view1 = IndexStatusView::new(
+            false,
+            Some(100.0),
+            20,
+            20,
+            None,
+            "Completed".to_string(),
+            false,
+        );
         assert!(view1.is_complete());
 
-        let view2 = IndexStatusView::new(true, Some(50.0), 10, 20, None, "InProgress".to_string());
+        let view2 = IndexStatusView::new(
+            true,
+            Some(50.0),
+            10,
+            20,
+            None,
+            "InProgress".to_string(),
+            false,
+        );
         assert!(!view2.is_complete());
     }
 
     #[test]
     fn test_completion_ratio() {
-        let view1 = IndexStatusView::new(true, Some(50.0), 10, 20, None, "InProgress".to_string());
+        let view1 = IndexStatusView::new(
+            true,
+            Some(50.0),
+            10,
+            20,
+            None,
+            "InProgress".to_string(),
+            false,
+        );
         assert_eq!(view1.completion_ratio(), 0.5);
 
         // Test edge case with 0 total files
-        let view2 = IndexStatusView::new(false, None, 0, 0, None, "Completed".to_string());
+        let view2 = IndexStatusView::new(false, None, 0, 0, None, "Completed".to_string(), false);
         assert_eq!(view2.completion_ratio(), 1.0);
     }
 }

@@ -31,7 +31,7 @@ pub use meson_provider::MesonProvider;
 
 pub use provider::{ProjectComponentProvider, ProjectProviderRegistry};
 
-pub use scanner::ProjectScanner;
+pub use scanner::{ProjectScanner, ScanOptions};
 
 pub use workspace::ProjectWorkspace;
 

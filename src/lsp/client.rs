@@ -62,9 +62,11 @@ pub struct LspClient<T: Transport> {
 
 impl<T: Transport + 'static> LspClient<T> {
     /// Create a new LSP client with a transport
-    pub fn new(transport: T) -> Self {
+    ///
+    /// `request_timeout` bounds every request issued through this client.
+    pub fn new(transport: T, request_timeout: std::time::Duration) -> Self {
         Self {
-            rpc_client: JsonRpcClient::new(transport),
+            rpc_client: JsonRpcClient::new(transport, request_timeout),
             initialized: false,
             server_capabilities: None,
         }

@@ -112,6 +112,10 @@ impl CompilationDatabase {
     }
 
     /// Get the path to the compilation database file
+    ///
+    /// Note: this is the database's own location, which is *not* a valid basis for
+    /// deriving clangd's index directory -- see `ClangdConfig::resolve_index_directory`.
+    #[allow(dead_code)]
     pub fn path(&self) -> &PathBuf {
         &self.path
     }

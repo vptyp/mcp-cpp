@@ -3,11 +3,18 @@
 //! This module provides functionality for parsing clangd index files to extract
 //! translation unit information and content hashes from the `srcs` chunk.
 //!
-//! Supports clangd format versions 12-20 with inline version handling.
+//! Supports clangd format versions 12 and up with inline version handling.
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use thiserror::Error;
+
+/// Oldest clangd index format this parser can read.
+///
+/// Formats below this use a different RIFF container layout, so rejecting them
+/// at the gate is the correct behaviour. There is intentionally no matching
+/// ceiling -- see `parse_meta_chunk`.
+const MIN_FORMAT_VERSION: u32 = 12;
 
 /// Errors that can occur during index file parsing
 #[derive(Debug, Error)]
@@ -212,7 +219,16 @@ impl IdxParser {
         let version =
             u32::from_le_bytes([chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3]]);
 
-        if !(12..=20).contains(&version) {
+        // Only the lower bound is a real compatibility boundary: formats below 12
+        // use a different container layout that this parser cannot read.
+        //
+        // There is deliberately no upper bound. The format version moves
+        // independently of the clangd release number, so we cannot predict the
+        // next one, and refusing an unknown-but-newer index is worse than trying
+        // it: every chunk read below is bounds-checked, so a genuinely
+        // incompatible layout surfaces as a specific parse error instead of
+        // blanket-invalidating a workspace the day clangd bumps the format.
+        if version < MIN_FORMAT_VERSION {
             return Err(IdxParseError::UnsupportedVersion(version));
         }
 
@@ -581,5 +597,75 @@ mod tests {
 
         let version_error = IdxParseError::UnsupportedVersion(99);
         assert!(version_error.to_string().contains("99"));
+    }
+
+    /// Build a minimal RIFF container carrying only a `meta` chunk at `version`.
+    ///
+    /// `extract_index_data` reads `meta` before `stri`, so a container with no
+    /// `stri` chunk isolates the version gate: a rejected version reports
+    /// `UnsupportedVersion`, while an accepted one gets as far as complaining
+    /// about the missing `stri` chunk. No valid payload needed either way.
+    fn meta_only_index(version: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        // Everything after this field: the "CdIx" type id plus the meta chunk.
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(b"CdIx");
+        data.extend_from_slice(b"meta");
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&version.to_le_bytes());
+        debug_assert_eq!(data.len(), 24);
+        data
+    }
+
+    /// Which side of the version gate a format version lands on.
+    fn version_is_accepted(version: u32) -> bool {
+        match IdxParser::parse(&meta_only_index(version)) {
+            Err(IdxParseError::UnsupportedVersion(v)) => {
+                assert_eq!(v, version, "reported the wrong version");
+                false
+            }
+            // Got past the gate and failed on the next chunk, as expected.
+            Err(IdxParseError::MissingChunk(chunk)) => {
+                assert_eq!(chunk, "stri", "failed on an unexpected chunk");
+                true
+            }
+            other => panic!("unexpected parse outcome for version {version}: {other:?}"),
+        }
+    }
+
+    /// Versions clangd has actually shipped must parse.
+    ///
+    /// clangd 20 through 22 all write format version 20 -- the format version
+    /// moves independently of the clangd release number, so it cannot be
+    /// derived from the version string.
+    #[test]
+    fn test_shipped_format_versions_are_accepted() {
+        for version in [12, 16, 17, 18, 19, 20] {
+            assert!(version_is_accepted(version), "version {version} rejected");
+        }
+    }
+
+    /// Versions older than the supported floor have a different container
+    /// layout, so rejecting them outright is correct.
+    #[test]
+    fn test_format_versions_below_floor_are_rejected() {
+        for version in [0, 1, 11] {
+            assert!(!version_is_accepted(version), "version {version} accepted");
+        }
+    }
+
+    /// A future clangd that bumps the format version must not be rejected
+    /// sight-unseen.
+    ///
+    /// The gate has no upper bound, so an unknown-but-newer index is parsed on
+    /// its merits: it either reads fine or fails on a specific chunk. What it
+    /// must never do is fail at the gate, which would invalidate an entire
+    /// workspace on the day clangd bumps the format.
+    #[test]
+    fn test_format_versions_above_known_range_are_attempted() {
+        for version in [21, 22, 25] {
+            assert!(version_is_accepted(version), "version {version} rejected");
+        }
     }
 }

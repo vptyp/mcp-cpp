@@ -12,6 +12,7 @@ use super::tools::index_status::GetIndexStatusTool;
 use super::tools::project_tools::GetProjectDetailsTool;
 use super::tools::search_symbols::SearchSymbolsTool;
 use super::tools::show_diagnostics::ShowDiagnosticsTool;
+use crate::config::AppConfig;
 use crate::project::{ProjectError, ProjectWorkspace, WorkspaceSession};
 use crate::register_tools;
 use crate::{log_mcp_message, log_timing};
@@ -26,9 +27,9 @@ pub struct CppServerHandler {
 impl CppServerHandler {
     pub fn new(
         project_workspace: ProjectWorkspace,
-        clangd_path: String,
+        config: Arc<AppConfig>,
     ) -> Result<Self, ProjectError> {
-        let workspace_session = WorkspaceSession::new(project_workspace, clangd_path)?;
+        let workspace_session = WorkspaceSession::new(project_workspace, config)?;
         Ok(Self { workspace_session })
     }
 
@@ -51,7 +52,7 @@ impl McpToolHandler<GetProjectDetailsTool> for CppServerHandler {
         tool: GetProjectDetailsTool,
     ) -> Result<CallToolResult, CallToolError> {
         let workspace = self.workspace_session.get_workspace().lock().await;
-        tool.call_tool(&workspace)
+        tool.call_tool(&workspace, self.workspace_session.config())
     }
 }
 

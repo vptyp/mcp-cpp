@@ -1,6 +1,5 @@
 //! Common utilities for MCP tools
 
-use crate::clangd::config::DEFAULT_INDEX_WAIT_TIMEOUT_SECS;
 use crate::project::ComponentSession;
 use crate::project::index::IndexStatusView;
 use std::time::Duration;
@@ -21,7 +20,7 @@ pub fn serialize_result(content: &serde_json::Value) -> String {
 /// # Arguments
 /// * `component_session` - The component session to use for indexing operations
 /// * `skip_indexing_condition` - Whether to skip indexing wait (e.g., has location_hint or files)
-/// * `wait_timeout` - Optional timeout in seconds (uses default if None)
+/// * `wait_timeout` - Optional timeout in seconds (falls back to the session's configured default)
 /// * `operation_type` - Human-readable operation type for logging (e.g., "document search", "workspace analysis")
 ///
 /// # Returns
@@ -39,17 +38,22 @@ pub async fn handle_selective_indexing_wait(
         Some(component_session.get_index_status().await)
     } else {
         // Workspace operation: Wait for indexing based on timeout parameter
-        let wait_timeout_secs = wait_timeout.unwrap_or(DEFAULT_INDEX_WAIT_TIMEOUT_SECS);
+        // No explicit timeout means "use whatever this project configured",
+        // not a compiled-in constant -- large trees legitimately need minutes.
+        let timeout = match wait_timeout {
+            Some(secs) => Duration::from_secs(secs),
+            None => component_session.index_wait_timeout(),
+        };
 
-        if wait_timeout_secs == 0 {
+        if timeout.is_zero() {
             info!("Zero timeout specified - skipping indexing wait");
             Some(component_session.get_index_status().await)
         } else {
             info!(
                 "{} detected - waiting for indexing completion ({}s)",
-                operation_type, wait_timeout_secs
+                operation_type,
+                timeout.as_secs()
             );
-            let timeout = Duration::from_secs(wait_timeout_secs);
             match component_session.ensure_indexed(timeout).await {
                 Ok(()) => {
                     info!("Indexing completed successfully");

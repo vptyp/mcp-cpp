@@ -94,21 +94,18 @@ impl ComponentIndex {
     ///
     /// All files are initialized as Pending - the ComponentIndexMonitor is responsible
     /// for checking disk state and updating file states appropriately.
+    ///
+    /// `index_dir` must be the directory clangd actually writes its shards to,
+    /// as resolved by [`ClangdConfig::resolve_index_directory`]. It is passed in
+    /// rather than derived from the compilation database path because those two
+    /// disagree whenever clangd is pointed at a project-root database.
+    ///
+    /// [`ClangdConfig::resolve_index_directory`]: crate::clangd::config::ClangdConfig::resolve_index_directory
     pub fn new(
         compilation_db: &CompilationDatabase,
         clangd_version: &ClangdVersion,
+        index_dir: PathBuf,
     ) -> Result<Self, ComponentIndexError> {
-        let compilation_db_path = compilation_db.path();
-        let compilation_db_dir = compilation_db_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-
-        // Index directory is .cache/clangd/index/ relative to compilation database
-        let index_dir = compilation_db_dir
-            .join(".cache")
-            .join("clangd")
-            .join("index");
-
         let format_version = clangd_version.index_format_version();
         let mut file_to_index = HashMap::new();
         let mut file_states = HashMap::new();
@@ -524,7 +521,9 @@ mod tests {
         let compilation_db = create_test_compilation_database(build_dir)?;
 
         let version = create_test_version();
-        let component_index = ComponentIndex::new(&compilation_db, &version).unwrap();
+        let component_index =
+            ComponentIndex::new(&compilation_db, &version, PathBuf::from("/fake/test/index"))
+                .unwrap();
 
         // All files should start as pending (pure in-memory, no disk checks)
         assert_eq!(component_index.total_files_count(), 2);
@@ -544,7 +543,9 @@ mod tests {
         let compilation_db = create_test_compilation_database(build_dir)?;
 
         let version = create_test_version();
-        let mut component_index = ComponentIndex::new(&compilation_db, &version).unwrap();
+        let mut component_index =
+            ComponentIndex::new(&compilation_db, &version, PathBuf::from("/fake/test/index"))
+                .unwrap();
 
         let main_cpp = Path::new("/test/project/main.cpp");
 
@@ -580,7 +581,9 @@ mod tests {
         let compilation_db = create_test_compilation_database(build_dir)?;
 
         let version = create_test_version();
-        let mut component_index = ComponentIndex::new(&compilation_db, &version).unwrap();
+        let mut component_index =
+            ComponentIndex::new(&compilation_db, &version, PathBuf::from("/fake/test/index"))
+                .unwrap();
 
         // Should return one of the pending files (all start as pending now)
         let next_file = component_index.get_next_uncovered_file();
@@ -614,7 +617,9 @@ mod tests {
         let compilation_db = create_test_compilation_database(build_dir)?;
 
         let version = create_test_version();
-        let mut component_index = ComponentIndex::new(&compilation_db, &version).unwrap();
+        let mut component_index =
+            ComponentIndex::new(&compilation_db, &version, PathBuf::from("/fake/test/index"))
+                .unwrap();
 
         let main_cpp = Path::new("/test/project/main.cpp");
         let utils_cpp = Path::new("/test/project/utils.cpp");
@@ -647,7 +652,9 @@ mod tests {
         let compilation_db = create_test_compilation_database(build_dir)?;
 
         let version = create_test_version();
-        let mut component_index = ComponentIndex::new(&compilation_db, &version).unwrap();
+        let mut component_index =
+            ComponentIndex::new(&compilation_db, &version, PathBuf::from("/fake/test/index"))
+                .unwrap();
 
         let main_cpp = Path::new("/test/project/main.cpp");
         let utils_cpp = Path::new("/test/project/utils.cpp");

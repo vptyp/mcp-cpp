@@ -41,6 +41,23 @@ pub enum ComponentIndexingState {
     Completed,
 }
 
+/// Progress of the one-off disk scan that reconciles in-memory state with the
+/// `.idx` shards clangd has already written.
+///
+/// Without this distinction `Init` is ambiguous: it means both "nothing is
+/// indexed" and "we have not looked yet". On an already-indexed tree clangd
+/// emits no `$/progress` at all, so the second meaning would persist forever
+/// and status would report `Init`/0 for a fully indexed component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialScanState {
+    /// The scan has not been kicked off yet
+    Pending,
+    /// The scan is running; reported counts are still provisional
+    Running,
+    /// The scan finished; reported counts reflect what is on disk
+    Complete,
+}
+
 /// High-level component state wrapper for compatibility
 #[derive(Debug, Clone)]
 pub struct ComponentIndexState {
@@ -109,6 +126,9 @@ struct IndexMonitorState {
     /// Component-level indexing state (Init, InProgress, Partial, Complete)
     current_indexing_state: ComponentIndexingState,
 
+    /// Whether the reconciling disk scan has run yet
+    initial_scan_state: InitialScanState,
+
     /// Synchronization latch for completion waiting
     completion_latch: IndexLatch,
 
@@ -152,12 +172,14 @@ impl ComponentIndexMonitor {
     #[allow(dead_code)]
     pub async fn new(
         build_directory: PathBuf,
+        index_directory: PathBuf,
         compilation_db: &CompilationDatabase,
         index_reader: Arc<dyn IndexReaderTrait>,
         clangd_version: &ClangdVersion,
     ) -> Result<Self, ProjectError> {
         Self::create_monitor(
             build_directory,
+            index_directory,
             compilation_db,
             index_reader,
             clangd_version,
@@ -171,6 +193,7 @@ impl ComponentIndexMonitor {
     #[cfg(test)]
     pub async fn new_with_trigger(
         build_directory: PathBuf,
+        index_directory: PathBuf,
         compilation_db: Arc<CompilationDatabase>,
         index_reader: Arc<dyn IndexReaderTrait>,
         clangd_version: &ClangdVersion,
@@ -178,6 +201,7 @@ impl ComponentIndexMonitor {
     ) -> Result<Self, ProjectError> {
         Self::create_monitor(
             build_directory,
+            index_directory,
             &compilation_db,
             index_reader,
             clangd_version,
@@ -195,6 +219,7 @@ impl ComponentIndexMonitor {
     /// [`trigger_initial_indexing`](Self::trigger_initial_indexing).
     pub async fn new_with_trigger_no_scan(
         build_directory: PathBuf,
+        index_directory: PathBuf,
         compilation_db: Arc<CompilationDatabase>,
         index_reader: Arc<dyn IndexReaderTrait>,
         clangd_version: &ClangdVersion,
@@ -202,6 +227,7 @@ impl ComponentIndexMonitor {
     ) -> Result<Self, ProjectError> {
         Self::create_monitor(
             build_directory,
+            index_directory,
             &compilation_db,
             index_reader,
             clangd_version,
@@ -231,6 +257,7 @@ impl ComponentIndexMonitor {
     /// Common monitor creation logic
     async fn create_monitor(
         build_directory: PathBuf,
+        index_directory: PathBuf,
         compilation_db: &CompilationDatabase,
         index_reader: Arc<dyn IndexReaderTrait>,
         clangd_version: &ClangdVersion,
@@ -242,6 +269,7 @@ impl ComponentIndexMonitor {
             index_reader,
             clangd_version,
             &build_directory,
+            index_directory,
         )?;
 
         let monitor = Self {
@@ -287,6 +315,7 @@ impl ComponentIndexMonitor {
             component_index,
             index_reader,
             current_indexing_state: ComponentIndexingState::Init,
+            initial_scan_state: InitialScanState::Pending,
             completion_latch,
             indexing_start_time: None,
             overall_current: None,
@@ -313,15 +342,17 @@ impl ComponentIndexMonitor {
         index_reader: Arc<dyn IndexReaderTrait>,
         clangd_version: &ClangdVersion,
         build_directory: &Path,
+        index_directory: PathBuf,
     ) -> Result<IndexMonitorState, ProjectError> {
         // Create component index from compilation database (all files start as Pending)
-        let component_index = ComponentIndex::new(compilation_db, clangd_version).map_err(|e| {
-            ProjectError::SessionCreation(format!(
-                "Failed to create component index for {}: {}",
-                build_directory.display(),
-                e
-            ))
-        })?;
+        let component_index = ComponentIndex::new(compilation_db, clangd_version, index_directory)
+            .map_err(|e| {
+                ProjectError::SessionCreation(format!(
+                    "Failed to create component index for {}: {}",
+                    build_directory.display(),
+                    e
+                ))
+            })?;
 
         // Get path mappings for efficient lookup without repeated canonicalization
         let path_mappings = compilation_db.path_mappings().map_err(|e| {
@@ -339,6 +370,7 @@ impl ComponentIndexMonitor {
             component_index,
             index_reader,
             current_indexing_state: ComponentIndexingState::Init,
+            initial_scan_state: InitialScanState::Pending,
             completion_latch,
             indexing_start_time: None,
             overall_current: None,
@@ -349,11 +381,34 @@ impl ComponentIndexMonitor {
     }
 
     /// Perform initial disk scan to update state from existing index files
+    ///
+    /// Reconciles in-memory state with the shards clangd has already written.
+    /// This is what lets an already-indexed component report as indexed: clangd
+    /// only announces work it actually performs, so on a warm tree it says
+    /// nothing and there is otherwise no evidence for the monitor to go on.
+    ///
+    /// Safe to run concurrently with clangd's progress events. The scan only
+    /// promotes files from Pending to Indexed and only advances the component
+    /// state when it is still `Init`, so it can never walk back a transition
+    /// that clangd's own reporting has already made.
     pub(crate) async fn perform_initial_scan(&self) {
         debug!(
             "Performing initial disk scan for build dir: {}",
             self.build_directory.display()
         );
+
+        {
+            let mut state = self.state.lock().await;
+            if state.initial_scan_state != InitialScanState::Pending {
+                debug!(
+                    "Initial disk scan already {:?} for {} - skipping",
+                    state.initial_scan_state,
+                    self.build_directory.display()
+                );
+                return;
+            }
+            state.initial_scan_state = InitialScanState::Running;
+        }
 
         if let Err(e) = self.rescan_and_validate_untracked_files().await {
             warn!(
@@ -363,13 +418,49 @@ impl ComponentIndexMonitor {
             );
         }
 
-        let state = self.state.lock().await;
-        debug!(
-            "Initial state after disk scan: {}/{} files indexed for {}",
-            state.component_index.indexed_count(),
-            state.component_index.total_files_count(),
-            self.build_directory.display()
-        );
+        let fully_indexed = {
+            let mut state = self.state.lock().await;
+            state.initial_scan_state = InitialScanState::Complete;
+            state.last_updated = std::time::SystemTime::now();
+
+            debug!(
+                "Initial state after disk scan: {}/{} files indexed for {}",
+                state.component_index.indexed_count(),
+                state.component_index.total_files_count(),
+                self.build_directory.display()
+            );
+
+            // Only conclude anything if clangd has not reported in the meantime.
+            // If it has, its own state machine is authoritative and further along.
+            let settled = state.current_indexing_state == ComponentIndexingState::Init
+                && state.component_index.is_fully_indexed();
+            if settled {
+                info!(
+                    "Disk scan found {} of {} files already indexed for {} - component is Completed",
+                    state.component_index.indexed_count(),
+                    state.component_index.total_files_count(),
+                    self.build_directory.display()
+                );
+                state.current_indexing_state = ComponentIndexingState::Completed;
+                state.indexing_start_time = None;
+            }
+            settled
+        };
+
+        // Release the waiters outside the lock: an already-indexed component has
+        // nothing to wait for, and clangd will not emit a completion event for
+        // work it never had to do.
+        if fully_indexed {
+            self.finalize_completion().await;
+        }
+    }
+
+    /// Whether the reconciling disk scan has finished
+    ///
+    /// Reported alongside the status so a caller can tell "nothing is indexed"
+    /// apart from "we have not finished looking yet".
+    pub async fn initial_scan_state(&self) -> InitialScanState {
+        self.state.lock().await.initial_scan_state
     }
 
     /// Handle progress event (single lock, focused responsibility)
@@ -1467,6 +1558,115 @@ mod tests {
         assert!((state.coverage() - 1.0).abs() < 0.001);
     }
 
+    /// A component whose files are all indexed on disk must report as Completed
+    /// even though clangd never says a word about it.
+    ///
+    /// This is the already-indexed-tree case: clangd loads the existing shards and
+    /// emits no `$/progress`, because there is no work to announce. Before the
+    /// disk scan was reinstated, the monitor had no other evidence and reported
+    /// `Init` with 0 of N files indexed forever -- on the very trees where the
+    /// index was in the best shape.
+    #[tokio::test]
+    async fn test_initial_scan_settles_already_indexed_component() {
+        let mut mock_reader = MockIndexReaderTrait::new();
+        mock_reader
+            .expect_has_index_files()
+            .returning(|| Box::pin(async { true }));
+        mock_reader.expect_indexed_source_files().returning(|| {
+            Box::pin(async { std::collections::HashSet::from([PathBuf::from("main.cpp")]) })
+        });
+        mock_reader.expect_read_index_for_file().returning(|path| {
+            let path = path.to_path_buf();
+            Box::pin(async move {
+                Ok(crate::project::index::reader::IndexEntry {
+                    absolute_path: path,
+                    status: crate::project::index::reader::FileIndexStatus::Done,
+                    index_format_version: Some(19),
+                    expected_format_version: 19,
+                    index_content_hash: None,
+                    current_file_hash: None,
+                    symbols: vec!["main".to_string()],
+                    index_file_size: Some(1024),
+                    index_created_at: None,
+                })
+            })
+        });
+
+        let monitor = ComponentIndexMonitor::new_for_test(
+            PathBuf::from("/test/project/build"),
+            Arc::new(create_test_compilation_db()),
+            Arc::new(mock_reader) as Arc<dyn IndexReaderTrait>,
+            &create_test_clangd_version(),
+        )
+        .await
+        .expect("Failed to create ComponentIndexMonitor");
+
+        assert_eq!(
+            monitor.initial_scan_state().await,
+            InitialScanState::Pending,
+            "scan must not have run before it is asked for"
+        );
+
+        monitor.perform_initial_scan().await;
+
+        assert_eq!(
+            monitor.initial_scan_state().await,
+            InitialScanState::Complete
+        );
+
+        let state = monitor.get_component_state().await;
+        assert_eq!(
+            state.state,
+            ComponentIndexingState::Completed,
+            "a fully indexed component must not report Init"
+        );
+        assert_eq!(state.indexed_cdb_files, 1);
+        assert_eq!(state.total_cdb_files, 1);
+
+        // Waiters must be released too: nothing is going to complete later, so a
+        // caller waiting on the latch would otherwise burn its whole timeout.
+        monitor
+            .wait_for_completion(Duration::from_millis(500))
+            .await
+            .expect("completion latch should already be satisfied");
+    }
+
+    /// The scan must not undo a transition clangd's own reporting already made.
+    #[tokio::test]
+    async fn test_initial_scan_defers_to_clangd_progress() {
+        let mut mock_reader = MockIndexReaderTrait::new();
+        mock_reader
+            .expect_has_index_files()
+            .returning(|| Box::pin(async { false }));
+
+        let monitor = ComponentIndexMonitor::new_for_test(
+            PathBuf::from("/test/project/build"),
+            Arc::new(create_test_compilation_db()),
+            Arc::new(mock_reader) as Arc<dyn IndexReaderTrait>,
+            &create_test_clangd_version(),
+        )
+        .await
+        .expect("Failed to create ComponentIndexMonitor");
+
+        // clangd reports it has started working before the scan gets there.
+        monitor
+            .handle_progress_event(ProgressEvent::OverallIndexingStarted)
+            .await;
+
+        monitor.perform_initial_scan().await;
+
+        let state = monitor.get_component_state().await;
+        assert!(
+            matches!(state.state, ComponentIndexingState::InProgress(_)),
+            "scan must leave clangd's InProgress alone, got {:?}",
+            state.state
+        );
+        assert_eq!(
+            monitor.initial_scan_state().await,
+            InitialScanState::Complete
+        );
+    }
+
     #[tokio::test]
     async fn test_indexing_completion_with_partial_coverage() {
         let mut mock_reader = MockIndexReaderTrait::new();
@@ -1924,7 +2124,8 @@ mod tests {
 
         // Create monitor with trigger
         let monitor = ComponentIndexMonitor::new_with_trigger(
-            build_dir,
+            build_dir.clone(),
+            build_dir.join(".cache/clangd/index"),
             Arc::new(compilation_db.clone()),
             mock_reader,
             &create_test_clangd_version(),
@@ -1976,7 +2177,8 @@ mod tests {
 
         // new_with_trigger performs the initial disk scan during creation
         let monitor = ComponentIndexMonitor::new_with_trigger(
-            build_dir,
+            build_dir.clone(),
+            build_dir.join(".cache/clangd/index"),
             Arc::new(compilation_db.clone()),
             mock_reader,
             &create_test_clangd_version(),
@@ -2045,7 +2247,8 @@ mod tests {
 
         // Create monitor with trigger
         let monitor = ComponentIndexMonitor::new_with_trigger(
-            build_dir,
+            build_dir.clone(),
+            build_dir.join(".cache/clangd/index"),
             Arc::new(compilation_db.clone()),
             mock_reader,
             &create_test_clangd_version(),
@@ -2077,7 +2280,8 @@ mod tests {
 
         // Create monitor with trigger
         let monitor = ComponentIndexMonitor::new_with_trigger(
-            build_dir,
+            build_dir.clone(),
+            build_dir.join(".cache/clangd/index"),
             Arc::new(empty_compilation_db.clone()),
             mock_reader,
             &create_test_clangd_version(),

@@ -24,8 +24,14 @@ async fn test_analyzer_members_math() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Test Math class - should have callable members
     let tool = AnalyzeSymbolContextTool {
@@ -139,8 +145,14 @@ async fn test_analyzer_members_interface() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Test IStorageBackend interface - should have virtual methods
     let tool = AnalyzeSymbolContextTool {
@@ -256,8 +268,14 @@ async fn test_analyzer_members_non_class() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Test a function - should have no members
     let tool = AnalyzeSymbolContextTool {

@@ -22,7 +22,14 @@ async fn test_indexing_progress_tracking_with_real_clangd() {
         .unwrap();
 
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace, clangd_path).unwrap();
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .unwrap();
 
     // Get component session first to create the monitor
     let component_session = workspace_session
@@ -70,7 +77,14 @@ async fn test_wait_for_indexing_completion_ensures_full_coverage() {
         .unwrap();
 
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace, clangd_path).unwrap();
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .unwrap();
 
     // Create session first - required for wait_for_indexing_completion
     let _component_session = workspace_session
@@ -116,7 +130,14 @@ async fn test_index_persistence_across_session_restarts() {
         .unwrap();
 
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path.clone()).unwrap();
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path.clone(),
+        )),
+    )
+    .unwrap();
 
     // Phase 1: Initial indexing - create session and wait for completion
     debug!("Phase 1: Starting initial indexing");
@@ -165,7 +186,14 @@ async fn test_index_persistence_across_session_restarts() {
     drop(workspace_session);
 
     // Recreate workspace session from scratch
-    let workspace_session = WorkspaceSession::new(workspace, clangd_path).unwrap();
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .unwrap();
 
     // Phase 3: Restart session and verify index state persistence
     debug!("Phase 3: Restarting session and verifying index persistence");
@@ -225,7 +253,14 @@ async fn test_meson_indexing_progress_tracking() {
         .unwrap();
 
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace, clangd_path).unwrap();
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .unwrap();
 
     // Get component session first to create the monitor
     let component_session = workspace_session
@@ -298,7 +333,14 @@ async fn test_meson_index_persistence_across_session_restarts() {
         .unwrap();
 
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path.clone()).unwrap();
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path.clone(),
+        )),
+    )
+    .unwrap();
 
     // Phase 1: Initial indexing - create session and wait for completion
     debug!("Phase 1: Starting initial Meson indexing");
@@ -347,7 +389,14 @@ async fn test_meson_index_persistence_across_session_restarts() {
     drop(workspace_session);
 
     // Recreate workspace session from scratch
-    let workspace_session = WorkspaceSession::new(workspace, clangd_path).unwrap();
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .unwrap();
 
     // Phase 3: Restart session and verify index state persistence
     debug!("Phase 3: Restarting Meson session and verifying index persistence");

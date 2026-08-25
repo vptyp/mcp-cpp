@@ -25,7 +25,7 @@ pub mod trigger;
 // Public exports
 #[cfg(all(test, feature = "clangd-integration-tests"))]
 pub use component_monitor::ComponentIndexState;
-pub use component_monitor::{ComponentIndexMonitor, ComponentIndexingState};
+pub use component_monitor::{ComponentIndexMonitor, ComponentIndexingState, InitialScanState};
 pub use status::IndexStatusView;
 pub use trigger::ClangdIndexTrigger;
 

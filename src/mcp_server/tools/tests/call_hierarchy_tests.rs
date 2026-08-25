@@ -24,8 +24,14 @@ async fn test_analyzer_call_hierarchy_function() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Test factorial function - should have callers from main.cpp
     let tool = AnalyzeSymbolContextTool {
@@ -92,8 +98,14 @@ async fn test_analyzer_call_hierarchy_method() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Test Math::Complex::add method - should have callers from main.cpp
     let tool = AnalyzeSymbolContextTool {
@@ -159,8 +171,14 @@ async fn test_analyzer_call_hierarchy_non_function() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Test a class - should have no call hierarchy
     let tool = AnalyzeSymbolContextTool {
@@ -222,8 +240,14 @@ async fn test_analyzer_call_hierarchy_coherence() {
 
     // Create a WorkspaceSession with test clangd path
     let clangd_path = crate::test_utils::get_test_clangd_path();
-    let workspace_session = WorkspaceSession::new(workspace.clone(), clangd_path)
-        .expect("Failed to create workspace session");
+    let workspace_session = WorkspaceSession::new(
+        workspace.clone(),
+        std::sync::Arc::new(crate::config::AppConfig::for_test(
+            &workspace.project_root_path,
+            clangd_path,
+        )),
+    )
+    .expect("Failed to create workspace session");
 
     // Ensure indexing is completed before testing call hierarchy coherence
     let component_session = workspace_session

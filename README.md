@@ -19,7 +19,7 @@ Advanced indexing monitoring tracks both clangd's index state and logs to ensure
 
 ## Features
 
-The server provides four core analysis tools for C++ development. The `get_project_details` tool performs dynamic CMake and Meson build environment discovery and enables configuration switching. For symbol exploration, `search_symbols` offers C++ symbol search with project boundary detection and intelligent filtering. When deeper analysis is needed, `analyze_symbol_context` provides symbol analysis with inheritance and call hierarchy support. For code health, `show_diagnostics` retrieves clangd's compile errors, warnings, and notes for a specific source file.
+The server provides five core analysis tools for C++ development. The `get_project_details` tool performs dynamic CMake and Meson build environment discovery, enables configuration switching, and reports the configuration the server resolved. For symbol exploration, `search_symbols` offers C++ symbol search with project boundary detection and intelligent filtering. When deeper analysis is needed, `analyze_symbol_context` provides symbol analysis with inheritance and call hierarchy support. For code health, `show_diagnostics` retrieves clangd's compile errors, warnings, and notes for a specific source file. And `get_index_status` reports how far clangd has got building its index, which matters on large trees where the first useful answer has to wait for indexing.
 
 The implementation works with both CMake and Meson projects, handling projects with multiple libraries and executables simultaneously. Advanced indexing monitors clangd's index state and logs to ensure complete symbol coverage, while intelligent filtering distinguishes between project code and external dependencies. The server automatically discovers and switches between build configurations, and includes a Python CLI tool for quick symbol exploration.
 
@@ -195,17 +195,64 @@ Tested on:
 
 ### CLI Options
 
-The server supports the following command-line options:
-
 ```bash
 mcp-cpp-server --help
 
 # Options:
 --root <DIR>             Project root directory to scan for build configurations (defaults to current directory)
---clangd-path <PATH>     Path to clangd executable (overrides CLANGD_PATH env var)
---log-level <LEVEL>      Log level (overrides RUST_LOG env var) 
+--clangd-path <PATH>     Path to clangd executable (overrides CLANGD_PATH env var and .mcp-cpp.yaml)
+--log-level <LEVEL>      Log level (overrides RUST_LOG env var)
 --log-file <FILE>        Log file path (overrides MCP_LOG_FILE env var)
+--transport <TRANSPORT>  Transport to serve on: stdio (default) or http (streamable HTTP)
+--host <HOST>            Host to bind the streamable-http server to (default: 127.0.0.1)
+--port <PORT>            Port to bind the streamable-http server to (default: 8080)
 ```
+
+### Project Configuration File (`.mcp-cpp.yaml`)
+
+Settings that belong to a project rather than to a machine go in a
+`.mcp-cpp.yaml` at the project root. It is optional — with no file the server
+uses the defaults below. Every key is optional, and unknown keys are rejected
+with an error naming the offending line, so a typo never silently does nothing.
+
+```yaml
+version: 1
+
+clangd:
+  path: clangd                  # binary to run
+  args: []                      # extra flags, appended last so they win
+  background_index: true        # --background-index
+  pch_storage: memory           # memory | disk
+  index_threads: null           # -j N; null means one per core
+  workspace_symbol_limit: 1000  # --limit-results
+  initialization_timeout: 30s   # wait for clangd to answer `initialize`
+  request_timeout: 30s          # bound on every LSP request
+  index_wait_timeout: 20s       # default for tools' `wait_timeout`
+
+project:
+  scan_depth: 3                 # how deep to look for build directories
+  skip_hidden: true             # ignore dot-directories while scanning
+  follow_symlinks: false
+  max_components: null          # null means no cap
+
+server:
+  host: 127.0.0.1               # streamable-http bind address
+  port: 8080
+```
+
+Durations accept human-readable strings (`500ms`, `30s`, `2m`, `1h`).
+
+**Precedence**, highest first: command-line arguments → environment variables →
+`.mcp-cpp.yaml` → built-in defaults. A missing file is normal; a malformed one
+is fatal, because silently ignoring settings you deliberately wrote is worse
+than refusing to start.
+
+The `get_project_details` tool reports the configuration the server actually
+resolved, along with the file it came from, so you can confirm your settings
+were picked up before blaming clangd.
+
+`host` defaults to loopback on purpose: this server exposes a project's entire
+source tree, so binding it to a routable address should be a deliberate act.
 
 ### Environment Variables
 
@@ -216,31 +263,39 @@ mcp-cpp-server --help
 
 ### Python CLI for Debugging
 
-The Python CLI helps you understand what your AI agent sees from the MCP server, making it useful for debugging interactions. Note that this tool is not included in the distributed package and must be used directly from the repository:
+The Python CLI helps you understand what your AI agent sees from the MCP server, making it useful for debugging interactions. It needs only the Python standard library. Note that this tool is not included in the distributed package and must be used directly from the repository:
 
 ```bash
 # Clone the repository if you haven't already
 git clone https://github.com/mpsm/mcp-cpp.git
 cd mcp-cpp
 
-# Install CLI dependencies
-pip install -r tools/requirements.txt
+# Discover build directories and see the resolved configuration
+python3 tools/lsp-cli.py project
+
+# Check how far clangd has got indexing
+python3 tools/lsp-cli.py index
 
 # Search for symbols (see what the agent would see)
-python3 tools/lsp-cli.py search-symbols "MyClass"
+python3 tools/lsp-cli.py search MyClass
 
 # Get complete API overview of a header file
-python3 tools/lsp-cli.py search-symbols "" --files include/api.h
+python3 tools/lsp-cli.py search "" --files include/api.h
 
 # Analyze a symbol with examples
-python3 tools/lsp-cli.py analyze-symbol "MyClass::process"
+python3 tools/lsp-cli.py analyze MyClass::process
 
 # Show clangd diagnostics (errors/warnings) for a source file
-python3 tools/lsp-cli.py show-diagnostics src/main.cpp
+python3 tools/lsp-cli.py diagnostics src/main.cpp
 
-# Get project overview
-python3 tools/lsp-cli.py get-project-details
+# Machine-readable output for scripting
+python3 tools/lsp-cli.py --format json search MyClass
 ```
+
+Output is YAML by default; `--format json` emits the tool result as JSON and
+`--format raw` the untouched JSON-RPC response. Each command also has a long
+alias matching its MCP tool name (`search-symbols`, `get-project-details`, …),
+and `--help` on any command documents its options.
 
 ### Basic Workflow
 
@@ -351,11 +406,29 @@ The server also assists with development workflows by enabling switching between
 
 **Options**:
 - `path` (optional): Project root path to scan. If different from server default, triggers fresh scan
-- `depth` (optional): Scan depth for component discovery (0-10 levels, default: 2). Controls how many directory levels below the current working directory to search for CMake/Meson components
+- `depth` (optional): Scan depth for component discovery (0-10 levels). Controls how many directory levels below the project root to search for CMake/Meson components. Defaults to `project.scan_depth` from `.mcp-cpp.yaml`, which is 3 if unset
+- `include_details` (optional): Include the full set of build options rather than just a count (default: false)
 
-**Output**: Complete project analysis including build configurations, components, compilation database status, and multi-provider discovery (CMake, Meson, etc.)
+**Output**: Complete project analysis including build configurations, components, compilation database status, multi-provider discovery (CMake, Meson, etc.), and a `configuration` block reporting the effective settings and the config file they came from
 
-**Component Discovery**: By default, scans 2 levels below the current working directory for components. When AI agents specify build directories outside this scope, the server creates components from those hint paths automatically.
+**Component Discovery**: By default, scans 3 levels below the project root for components. When AI agents specify build directories outside this scope, the server creates components from those hint paths automatically.
+
+#### `get_index_status`
+
+**Purpose**: Report clangd's indexing progress for a build directory without running a search
+
+**Options**:
+- `build_directory` (optional): Build directory to report on. Defaults to the auto-detected one
+- `wait_timeout` (optional): Seconds to wait for indexing to finish before answering (default: 0, answer immediately)
+
+**Output**: Whether indexing is in progress, percentage complete, files indexed vs total, and an estimated time remaining.
+
+Cheap enough to poll. On a tree that was already indexed in a previous run, clangd reports no progress at all — there is no work for it to announce — so the server reconciles against the index on disk in the background and reports `Completed` once it has. While that reconciliation is still running the response carries `scan_in_progress: true`, meaning the counts are provisional rather than final.
+
+```bash
+get_index_status {}
+get_index_status {"build_directory": "/path/to/build", "wait_timeout": 300}
+```
 
 #### `search_symbols`
 

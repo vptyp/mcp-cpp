@@ -240,7 +240,7 @@ impl ClangdSessionBuilder<HasConfig, NoProcessManager, NoLspClient> {
         transport: StdioTransport,
     ) -> Result<LspClient<StdioTransport>, ClangdSessionError> {
         debug!("Creating LSP client");
-        let mut lsp_client = LspClient::new(transport);
+        let mut lsp_client = LspClient::new(transport, config.lsp_config.request_timeout);
 
         debug!("Initializing LSP connection");
         let root_uri = config.get_root_uri();

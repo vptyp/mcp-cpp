@@ -31,8 +31,7 @@ pub fn xxhash64(mut data: &[u8], seed: u64) -> u64 {
         let mut v3 = seed;
         let mut v4 = seed.wrapping_sub(PRIME64_1);
 
-        let chunks = data.chunks_exact(32);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<32>();
 
         for chunk in chunks {
             v1 = xxh64_round(v1, read_u64_le(&chunk[0..8]));

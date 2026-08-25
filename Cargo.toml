@@ -34,6 +34,8 @@ regex = "1.11"
 sha2 = "0.10"
 json_compilation_db = "1.0"
 sublime_fuzzy = "0.7"
+serde_norway = "0.9.42"
+humantime-serde = "1.1.1"
 
 [dev-dependencies]
 tempfile = "3.0"

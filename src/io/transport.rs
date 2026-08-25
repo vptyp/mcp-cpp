@@ -105,7 +105,7 @@ impl StdoutReaderState {
         match std::str::from_utf8(&self.byte_buffer) {
             Ok(_) => {
                 // All bytes are valid UTF-8 - extract everything
-                Some(self.byte_buffer.drain(..).collect())
+                Some(std::mem::take(&mut self.byte_buffer))
             }
             Err(e) => {
                 let valid_end = e.valid_up_to();
