@@ -300,10 +300,6 @@ class McpClient:
         except FileNotFoundError:
             raise McpCliError(f"Could not execute MCP server: {self.server_path}")
     
-    def list_tools(self) -> Dict:
-        """List available tools"""
-        return self._send_request("tools/list")
-    
     def call_tool(self, name: str, arguments: Dict) -> Dict:
         """Call a specific tool with arguments"""
         params = {
@@ -372,7 +368,7 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s list-tools
+  %(prog)s get-index-status --build-directory /abs/path/build
   %(prog)s search-symbols Math --max-results 20
   %(prog)s search-class WebContents --max-results 10
   %(prog)s search-method "WebContents::" --max-results 10
@@ -438,12 +434,21 @@ Examples:
     # Subcommands
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
-    # list-tools subcommand
-    list_tools_parser = subparsers.add_parser(
-        "list-tools",
-        help="List available MCP tools"
+    # get-index-status subcommand
+    index_status_parser = subparsers.add_parser(
+        "get-index-status",
+        help="Show only the current clangd indexing status for a build directory"
     )
-    
+    index_status_parser.add_argument(
+        "--build-directory",
+        type=str,
+        help="Specify build directory path containing compile_commands.json"
+    )
+    index_status_parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        help="Seconds to wait for indexing to complete before returning status (default: 0 = immediate current status)"
+    )
     # search-symbols subcommand
     search_parser = subparsers.add_parser(
         "search-symbols",
@@ -752,10 +757,7 @@ def main():
             client = McpClient(server_path)
         
         # Execute the appropriate command
-        if args.command == "list-tools":
-            response = client.list_tools()
-            
-        elif args.command == "search-symbols":
+        if args.command == "search-symbols":
             response = client.call_tool("search_symbols", _build_search_arguments(args))
             
         elif args.command == "search-class":
@@ -785,6 +787,14 @@ def main():
                 
             response = client.call_tool("analyze_symbol_context", arguments)
             
+        elif args.command == "get-index-status":
+            arguments = {}
+            if getattr(args, 'build_directory', None):
+                arguments["build_directory"] = args.build_directory
+            if getattr(args, 'wait_timeout', None) is not None:
+                arguments["wait_timeout"] = args.wait_timeout
+            response = client.call_tool("get_index_status", arguments)
+
         elif args.command == "get-project-details":
             arguments = {}
             if hasattr(args, 'path') and args.path:
@@ -877,12 +887,6 @@ def format_pretty_json_output(response: Dict) -> None:
 
 def _format_simple_output(response: Dict) -> None:
     """Simple text output when rich is not available"""
-    # Handle list-tools specially (different response format)
-    if "result" in response and "tools" in response["result"]:
-        # This is a list-tools response
-        print(json.dumps(response["result"], indent=2))
-        return
-    
     # Handle tool call responses
     if "result" in response and "content" in response["result"]:
         content = response["result"]["content"]
@@ -903,14 +907,6 @@ def _format_rich_output(command: str, response: Dict, show_code: bool = True, sh
     console = Console()
     
     try:
-        # Handle list-tools specially (different response format)
-        if command == "list-tools":
-            if "result" not in response or "tools" not in response["result"]:
-                console.print("[red]Invalid response format for list-tools[/red]")
-                return
-            _format_tools_list(console, response["result"])
-            return
-        
         # Extract the actual data from MCP response for tool calls
         if "result" not in response or "content" not in response["result"]:
             console.print("[red]Invalid response format[/red]")
@@ -929,8 +925,8 @@ def _format_rich_output(command: str, response: Dict, show_code: bool = True, sh
             return
             
         # Format based on command type
-        if command == "list-tools":
-            _format_tools_list(console, data)
+        if command == "get-index-status":
+            _format_index_status(console, data.get("index_status"))
         elif command in ("search-symbols", "search-class", "search-method"):
             _format_symbols_search(console, data)
         elif command == "analyze-symbol":
@@ -947,39 +943,6 @@ def _format_rich_output(command: str, response: Dict, show_code: bool = True, sh
     except Exception as e:
         console.print(f"[red]Error formatting output: {e}[/red]")
         _format_simple_output(response)
-
-
-def _format_tools_list(console, data: Dict) -> None:
-    """Format tools list output"""
-    if "tools" not in data:
-        console.print("[yellow]No tools found in response[/yellow]")
-        return
-        
-    table = Table(title="Available MCP Tools", show_header=True, header_style="bold magenta")
-    table.add_column("Tool Name", style="cyan", width=20)
-    table.add_column("Description", style="white")
-    table.add_column("Input Schema", style="green", width=30)
-    
-    for tool in data["tools"]:
-        name = tool.get("name", "Unknown")
-        description = tool.get("description", "No description")
-        
-        # Extract input schema info
-        schema_info = "No schema"
-        if "inputSchema" in tool and "properties" in tool["inputSchema"]:
-            props = tool["inputSchema"]["properties"]
-            required = tool["inputSchema"].get("required", [])
-            schema_parts = []
-            for prop, details in props.items():
-                prop_type = details.get("type", "unknown")
-                is_required = prop in required
-                marker = "*" if is_required else ""
-                schema_parts.append(f"{prop}{marker}: {prop_type}")
-            schema_info = "\n".join(schema_parts)
-        
-        table.add_row(name, description, schema_info)
-    
-    console.print(table)
 
 
 def _format_index_status(console, index_status: Dict) -> None:

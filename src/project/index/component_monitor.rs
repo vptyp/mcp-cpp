@@ -60,6 +60,7 @@ pub struct ComponentIndexState {
 
 impl ComponentIndexState {
     /// Create from ComponentIndex for compatibility
+    #[allow(dead_code)]
     pub fn from_component_index(
         component_index: &ComponentIndex,
         state: ComponentIndexingState,
@@ -114,6 +115,14 @@ struct IndexMonitorState {
     /// When indexing started, None if not started or completed
     indexing_start_time: Option<std::time::SystemTime>,
 
+    /// clangd's overall `current` from the latest `$/progress` report (files
+    /// indexed in this background pass). Surfaced directly to status instead
+    /// of our own per-file counter, which resets on restart and ignores
+    /// already-indexed files.
+    overall_current: Option<u32>,
+    /// clangd's overall `total` from the latest `$/progress` report.
+    overall_total: Option<u32>,
+
     /// Last updated timestamp
     last_updated: std::time::SystemTime,
 
@@ -159,6 +168,7 @@ impl ComponentIndexMonitor {
     }
 
     /// Create monitor for specific build directory with optional index trigger
+    #[cfg(test)]
     pub async fn new_with_trigger(
         build_directory: PathBuf,
         compilation_db: Arc<CompilationDatabase>,
@@ -173,6 +183,30 @@ impl ComponentIndexMonitor {
             clangd_version,
             index_trigger,
             true, // perform_scan = true for production version
+        )
+        .await
+    }
+
+    /// Create monitor for specific build directory with optional index trigger,
+    /// WITHOUT running the initial disk scan. Production session creation uses this
+    /// so the (potentially slow) index scan runs in the background and does not
+    /// block the first request; the caller is responsible for invoking
+    /// [`perform_initial_scan`](Self::perform_initial_scan) and
+    /// [`trigger_initial_indexing`](Self::trigger_initial_indexing).
+    pub async fn new_with_trigger_no_scan(
+        build_directory: PathBuf,
+        compilation_db: Arc<CompilationDatabase>,
+        index_reader: Arc<dyn IndexReaderTrait>,
+        clangd_version: &ClangdVersion,
+        index_trigger: Option<Arc<dyn IndexTrigger>>,
+    ) -> Result<Self, ProjectError> {
+        Self::create_monitor(
+            build_directory,
+            &compilation_db,
+            index_reader,
+            clangd_version,
+            index_trigger,
+            false, // perform_scan = false: scan is deferred to the caller
         )
         .await
     }
@@ -255,6 +289,8 @@ impl ComponentIndexMonitor {
             current_indexing_state: ComponentIndexingState::Init,
             completion_latch,
             indexing_start_time: None,
+            overall_current: None,
+            overall_total: None,
             last_updated: std::time::SystemTime::now(),
             path_mappings,
         };
@@ -305,13 +341,15 @@ impl ComponentIndexMonitor {
             current_indexing_state: ComponentIndexingState::Init,
             completion_latch,
             indexing_start_time: None,
+            overall_current: None,
+            overall_total: None,
             last_updated: std::time::SystemTime::now(),
             path_mappings,
         })
     }
 
     /// Perform initial disk scan to update state from existing index files
-    async fn perform_initial_scan(&self) {
+    pub(crate) async fn perform_initial_scan(&self) {
         debug!(
             "Performing initial disk scan for build dir: {}",
             self.build_directory.display()
@@ -629,6 +667,8 @@ impl ComponentIndexMonitor {
         // Transition component state from Init to InProgress and set start time
         state.current_indexing_state = ComponentIndexingState::InProgress(0.0);
         state.indexing_start_time = Some(std::time::SystemTime::now());
+        state.overall_current = None;
+        state.overall_total = None;
         state.last_updated = std::time::SystemTime::now();
         debug!(
             "Component state transitioned to InProgress for {}",
@@ -660,8 +700,19 @@ impl ComponentIndexMonitor {
             current, total, percentage, message
         );
 
-        // Update component state with progress percentage
-        state.current_indexing_state = ComponentIndexingState::InProgress(percentage as f32);
+        // Surface clangd's own progress directly. clangd's `percentage` field is
+        // a rounded u8 that stays 0 until 1% is reached, so compute a precise
+        // percentage from current/total for a useful display and ETA.
+        state.overall_current = Some(current);
+        if total > 1 {
+            state.overall_total = Some(total);
+        }
+        let precise_pct = if total > 0 {
+            (current as f32 / total as f32) * 100.0
+        } else {
+            percentage as f32
+        };
+        state.current_indexing_state = ComponentIndexingState::InProgress(precise_pct);
         state.last_updated = std::time::SystemTime::now();
         trace!(
             "Component progress updated to {}% for {}",
@@ -676,6 +727,24 @@ impl ComponentIndexMonitor {
             "Overall indexing completed for build directory: {}",
             self.build_directory.display()
         );
+
+        // clangd signalled completion: reflect 100% from clangd's own totals.
+        {
+            let mut state = match self.state.try_lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(
+                        "Could not acquire lock on component monitor state for {}",
+                        self.build_directory.display()
+                    );
+                    return;
+                }
+            };
+            if let Some(total) = state.overall_total {
+                state.overall_current = Some(total);
+            }
+            state.last_updated = std::time::SystemTime::now();
+        }
 
         // Perform validation of untracked index files
         self.perform_post_completion_validation().await;
@@ -870,10 +939,23 @@ impl ComponentIndexMonitor {
     /// Get progress tracking data including start time for ETA calculation
     pub async fn get_progress_data(&self) -> (ComponentIndexState, Option<std::time::SystemTime>) {
         let state = self.state.lock().await;
-        let component_state = ComponentIndexState::from_component_index(
-            &state.component_index,
-            state.current_indexing_state.clone(),
-        );
+        // Prefer clangd's own `$/progress` current/total (what VS Code displays).
+        // Fall back to our component_index counts only before clangd has reported.
+        let total_cdb_files = state
+            .overall_total
+            .filter(|t| *t > 1)
+            .map(|t| t as usize)
+            .unwrap_or_else(|| state.component_index.total_files_count());
+        let indexed_cdb_files = state
+            .overall_current
+            .map(|c| c as usize)
+            .unwrap_or(state.component_index.indexed_count());
+        let component_state = ComponentIndexState {
+            state: state.current_indexing_state.clone(),
+            total_cdb_files,
+            indexed_cdb_files,
+            last_updated: std::time::SystemTime::now(),
+        };
         (component_state, state.indexing_start_time)
     }
 
@@ -948,13 +1030,19 @@ impl ComponentIndexMonitor {
             self.build_directory.display()
         );
 
-        let mut state = self.state.lock().await;
-        let pending_files: Vec<_> = state
-            .component_index
-            .get_pending_files()
-            .iter()
-            .map(|p| p.to_path_buf())
-            .collect();
+        // Gather pending files and the index reader under a brief lock. We must NOT
+        // hold the state lock while parsing index files: that is the slowest part of
+        // session init on large trees and would serialize all other state queries.
+        let (pending_files, index_reader) = {
+            let state = self.state.lock().await;
+            let pending: Vec<_> = state
+                .component_index
+                .get_pending_files()
+                .iter()
+                .map(|p| p.to_path_buf())
+                .collect();
+            (pending, Arc::clone(&state.index_reader))
+        };
 
         if pending_files.is_empty() {
             debug!(
@@ -967,7 +1055,7 @@ impl ComponentIndexMonitor {
         // Short-circuit: if there are no index files on disk, there is nothing to
         // validate. This avoids O(N) per-file directory listings for fresh build
         // directories (e.g., large projects like Chromium with 70k+ files).
-        if !state.index_reader.has_index_files().await {
+        if !index_reader.has_index_files().await {
             debug!(
                 "No index files on disk for build dir: {} - skipping rescan",
                 self.build_directory.display()
@@ -979,56 +1067,98 @@ impl ComponentIndexMonitor {
         // directory listing. Only these files can possibly be validated, so we
         // avoid per-file filesystem operations (e.g., canonicalization) for the
         // many source files that have no index file at all.
-        let indexed_sources = state.index_reader.indexed_source_files().await;
+        let indexed_sources = index_reader.indexed_source_files().await;
+
+        let to_validate: Vec<PathBuf> = pending_files
+            .iter()
+            .filter(|f| {
+                f.file_name()
+                    .map(|n| indexed_sources.contains(Path::new(n)))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
 
         debug!(
             "Found {} pending files to validate for build dir: {}",
-            pending_files.len(),
+            to_validate.len(),
             self.build_directory.display()
         );
 
+        // Parse index files concurrently. Parsing clangd's binary .idx files is the
+        // dominant cost of session init on large trees (e.g. Chromium's ~100k idx
+        // files) and is embarrassingly parallel.
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get().max(1))
+            .unwrap_or(4);
+
+        let mut set = tokio::task::JoinSet::new();
+        let mut iter = to_validate.into_iter();
+        let mut inflight = 0usize;
+        while inflight < concurrency {
+            if let Some(sf) = iter.next() {
+                let reader = Arc::clone(&index_reader);
+                set.spawn(async move {
+                    let res = reader.read_index_for_file(&sf).await;
+                    (sf, res)
+                });
+                inflight += 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut results = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((sf, res)) => results.push((sf, res)),
+                Err(e) => warn!("Index validation task failed: {}", e),
+            }
+            if let Some(sf) = iter.next() {
+                let reader = Arc::clone(&index_reader);
+                set.spawn(async move {
+                    let res = reader.read_index_for_file(&sf).await;
+                    (sf, res)
+                });
+            }
+        }
+
+        // Apply validation results under a single brief lock.
+        let mut state = self.state.lock().await;
         let mut files_validated = 0;
         let mut files_invalid = 0;
         let mut validation_errors = Vec::new();
 
-        for source_file in &pending_files {
-            // Skip files that have no index file on disk - they are genuinely
-            // pending and don't need a filesystem check.
-            if let Some(name) = source_file.file_name()
-                && !indexed_sources.contains(Path::new(name))
-            {
-                continue;
-            }
-
-            match state.index_reader.read_index_for_file(source_file).await {
-                Ok(index_entry) => {
-                    let validation_result = self.validate_index_entry(source_file, &index_entry);
-                    match validation_result {
-                        IndexValidationResult::Valid => {
-                            state.component_index.mark_file_indexed(source_file);
-                            files_validated += 1;
-                        }
-                        IndexValidationResult::Invalid(error_msg) => {
-                            files_invalid += 1;
-                            validation_errors.push(error_msg.clone());
-                            debug!("{}", error_msg);
-                        }
-                        IndexValidationResult::NotFound => {
-                            trace!("No existing index found for file: {:?}", source_file);
-                        }
-                        IndexValidationResult::InProgress => {
-                            trace!(
-                                "File currently being indexed by another process: {:?}",
-                                source_file
-                            );
-                        }
-                    }
-                }
+        for (source_file, res) in results {
+            let index_entry = match res {
+                Ok(e) => e,
                 Err(e) => {
                     // Error reading index - leave as pending and log warning
                     let error_msg = format!("Failed to read index for {:?}: {}", source_file, e);
                     validation_errors.push(error_msg.clone());
                     warn!("{}", error_msg);
+                    continue;
+                }
+            };
+            let validation_result = self.validate_index_entry(&source_file, &index_entry);
+            match validation_result {
+                IndexValidationResult::Valid => {
+                    state.component_index.mark_file_indexed(&source_file);
+                    files_validated += 1;
+                }
+                IndexValidationResult::Invalid(error_msg) => {
+                    files_invalid += 1;
+                    validation_errors.push(error_msg.clone());
+                    debug!("{}", error_msg);
+                }
+                IndexValidationResult::NotFound => {
+                    trace!("No existing index found for file: {:?}", source_file);
+                }
+                IndexValidationResult::InProgress => {
+                    trace!(
+                        "File currently being indexed by another process: {:?}",
+                        source_file
+                    );
                 }
             }
         }

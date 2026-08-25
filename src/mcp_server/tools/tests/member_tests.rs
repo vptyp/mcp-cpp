@@ -40,7 +40,8 @@ async fn test_analyzer_members_math() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
-    let result = tool.call_tool(component_session, &workspace).await;
+    let component = component_session.component().clone();
+    let result = tool.call_tool(component_session, &component).await;
 
     assert!(result.is_ok());
 
@@ -154,7 +155,8 @@ async fn test_analyzer_members_interface() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
-    let result = tool.call_tool(component_session, &workspace).await;
+    let component = component_session.component().clone();
+    let result = tool.call_tool(component_session, &component).await;
 
     assert!(result.is_ok());
 
@@ -270,7 +272,8 @@ async fn test_analyzer_members_non_class() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
-    let result = tool.call_tool(component_session, &workspace).await;
+    let component = component_session.component().clone();
+    let result = tool.call_tool(component_session, &component).await;
 
     assert!(result.is_ok());
 

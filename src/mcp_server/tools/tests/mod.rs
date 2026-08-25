@@ -16,8 +16,8 @@ pub mod hover_tests;
 #[cfg(all(test, feature = "clangd-integration-tests"))]
 pub mod member_tests;
 #[cfg(all(test, feature = "clangd-integration-tests"))]
-pub mod symbol_resolution_tests;
-#[cfg(all(test, feature = "clangd-integration-tests"))]
 pub mod show_diagnostics_tests;
+#[cfg(all(test, feature = "clangd-integration-tests"))]
+pub mod symbol_resolution_tests;
 #[cfg(all(test, feature = "clangd-integration-tests"))]
 pub mod type_hierarchy_tests;

@@ -4,6 +4,7 @@
 //! including symbol analysis, project analysis, and LSP helper functions.
 
 pub mod analyze_symbols;
+pub mod index_status;
 pub mod lsp_helpers;
 pub mod project_tools;
 pub mod search_symbols;

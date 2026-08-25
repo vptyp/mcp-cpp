@@ -8,6 +8,7 @@ use tracing::{Level, info};
 
 use super::server_helpers::{self, McpToolHandler};
 use super::tools::analyze_symbols::AnalyzeSymbolContextTool;
+use super::tools::index_status::GetIndexStatusTool;
 use super::tools::project_tools::GetProjectDetailsTool;
 use super::tools::search_symbols::SearchSymbolsTool;
 use super::tools::show_diagnostics::ShowDiagnosticsTool;
@@ -76,8 +77,10 @@ impl McpToolHandler<SearchSymbolsTool> for CppServerHandler {
                 )))
             })?;
 
-        let workspace = self.workspace_session.get_workspace().lock().await;
-        tool.call_tool(component_session, &workspace).await
+        // Snapshot the component under a short lock; do NOT hold the workspace lock
+        // across the (potentially slow) clangd query below.
+        let component = component_session.component().clone();
+        tool.call_tool(component_session, &component).await
     }
 }
 
@@ -102,8 +105,8 @@ impl McpToolHandler<AnalyzeSymbolContextTool> for CppServerHandler {
                 )))
             })?;
 
-        let workspace = self.workspace_session.get_workspace().lock().await;
-        tool.call_tool(component_session, &workspace).await
+        let component = component_session.component().clone();
+        tool.call_tool(component_session, &component).await
     }
 }
 
@@ -129,8 +132,35 @@ impl McpToolHandler<ShowDiagnosticsTool> for CppServerHandler {
                 )))
             })?;
 
-        let workspace = self.workspace_session.get_workspace().lock().await;
-        tool.call_tool(component_session, &workspace).await
+        let component = component_session.component().clone();
+        tool.call_tool(component_session, &component).await
+    }
+}
+
+impl McpToolHandler<GetIndexStatusTool> for CppServerHandler {
+    const TOOL_NAME: &'static str = "get_index_status";
+
+    async fn call_tool_async(
+        &self,
+        tool: GetIndexStatusTool,
+    ) -> Result<CallToolResult, CallToolError> {
+        let build_dir = self
+            .resolve_build_directory(tool.build_directory.as_deref())
+            .await?;
+
+        let component_session = self
+            .workspace_session
+            .get_component_session(build_dir)
+            .await
+            .map_err(|e| {
+                CallToolError::new(std::io::Error::other(format!(
+                    "ComponentSession creation failed: {}",
+                    e
+                )))
+            })?;
+
+        let component = component_session.component().clone();
+        tool.call_tool(component_session, &component).await
     }
 }
 
@@ -141,6 +171,7 @@ register_tools! {
         SearchSymbolsTool => call_tool_async (async),
         AnalyzeSymbolContextTool => call_tool_async (async),
         ShowDiagnosticsTool => call_tool_async (async),
+        GetIndexStatusTool => call_tool_async (async),
     }
 }
 

@@ -32,7 +32,7 @@ use crate::mcp_server::tools::lsp_helpers::document_symbols::SymbolSearchBuilder
 use crate::mcp_server::tools::lsp_helpers::workspace_symbols::WorkspaceSymbolSearchBuilder;
 use crate::mcp_server::tools::utils;
 use crate::project::index::IndexStatusView;
-use crate::project::{ComponentSession, ProjectComponent, ProjectWorkspace};
+use crate::project::{ComponentSession, ProjectComponent};
 use crate::symbol::Symbol;
 
 /// Search result structure for search_symbols tool
@@ -189,11 +189,11 @@ pub struct SearchSymbolsTool {
 }
 
 impl SearchSymbolsTool {
-    #[instrument(name = "search_symbols", skip(self, component_session, workspace))]
+    #[instrument(name = "search_symbols", skip(self, component_session, component))]
     pub async fn call_tool(
         &self,
         component_session: Arc<ComponentSession>,
-        workspace: &ProjectWorkspace,
+        component: &ProjectComponent,
     ) -> Result<CallToolResult, CallToolError> {
         // Convert string kinds to SymbolKind enums once at the start
         let symbol_kinds: Option<Vec<lsp_types::SymbolKind>> =
@@ -233,15 +233,9 @@ impl SearchSymbolsTool {
         )
         .await;
 
-        // Get the component for this session's build directory
-        let build_dir = component_session.build_dir();
-        let component = workspace
-            .get_component_by_build_dir(build_dir)
-            .ok_or_else(|| {
-                CallToolError::new(std::io::Error::other(
-                    "Build directory not found in workspace",
-                ))
-            })?;
+        // The component comes from the session directly, so we no longer need to
+        // look it up under the workspace lock (avoids holding the lock across the
+        // blocking clangd query).
 
         // Determine search scope and delegate to appropriate LSP method.
         // File-specific searches use textDocument/documentSymbol for precise results,

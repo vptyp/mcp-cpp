@@ -40,7 +40,8 @@ async fn test_analyzer_call_hierarchy_function() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
-    let result = tool.call_tool(component_session, &workspace).await;
+    let component = component_session.component().clone();
+    let result = tool.call_tool(component_session, &component).await;
 
     assert!(result.is_ok());
 
@@ -107,7 +108,8 @@ async fn test_analyzer_call_hierarchy_method() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
-    let result = tool.call_tool(component_session, &workspace).await;
+    let component = component_session.component().clone();
+    let result = tool.call_tool(component_session, &component).await;
 
     assert!(result.is_ok());
 
@@ -173,7 +175,8 @@ async fn test_analyzer_call_hierarchy_non_function() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
-    let result = tool.call_tool(component_session, &workspace).await;
+    let component = component_session.component().clone();
+    let result = tool.call_tool(component_session, &component).await;
 
     assert!(result.is_ok());
 
@@ -261,8 +264,9 @@ async fn test_analyzer_call_hierarchy_coherence() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
+    let component = component_session.component().clone();
     let variance_result = variance_tool
-        .call_tool(component_session, &workspace)
+        .call_tool(component_session, &component)
         .await
         .expect("Failed to analyze variance");
 
@@ -306,8 +310,9 @@ async fn test_analyzer_call_hierarchy_coherence() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
+    let component = component_session.component().clone();
     let mean_result = mean_tool
-        .call_tool(component_session, &workspace)
+        .call_tool(component_session, &component)
         .await
         .expect("Failed to analyze mean");
 
@@ -351,8 +356,9 @@ async fn test_analyzer_call_hierarchy_coherence() {
         .get_component_session(test_project.build_dir.clone())
         .await
         .unwrap();
+    let component = component_session.component().clone();
     let std_dev_result = std_dev_tool
-        .call_tool(component_session, &workspace)
+        .call_tool(component_session, &component)
         .await
         .expect("Failed to analyze standardDeviation");
 

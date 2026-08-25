@@ -27,12 +27,51 @@ pub struct WorkspaceSession {
     workspace: Arc<Mutex<ProjectWorkspace>>,
     /// Map of build directories to their ComponentSession instances
     component_sessions: Arc<Mutex<HashMap<PathBuf, Arc<ComponentSession>>>>,
+    /// In-flight session creations: build dir -> shared slot that the single creator
+    /// fills (with the resulting session or an error) and notifies. Concurrent first
+    /// requests await the same slot so they share one session/clangd instead of
+    /// spawning duplicates.
+    session_creation: Arc<Mutex<HashMap<PathBuf, Arc<CreationSlot>>>>,
     /// Path to clangd executable
     clangd_path: String,
     /// Clangd version information
     clangd_version: ClangdVersion,
     /// Project scanner for dynamic component discovery
     scanner: ProjectScanner,
+}
+
+/// Shared slot for deduplicating in-flight session creation. The single creator
+/// stores the outcome and notifies all waiters.
+struct CreationSlot {
+    notify: tokio::sync::Notify,
+    result: std::sync::Mutex<Option<Result<Arc<ComponentSession>, String>>>,
+}
+
+impl CreationSlot {
+    fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            result: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn store_result(&self, result: Option<Result<Arc<ComponentSession>, String>>) {
+        *self.result.lock().unwrap() = result;
+        self.notify.notify_waiters();
+    }
+
+    async fn await_result(&self) -> Option<Result<Arc<ComponentSession>, String>> {
+        // Return immediately if the result is already stored.
+        if let Some(r) = self.result.lock().unwrap().as_ref() {
+            return Some(r.clone());
+        }
+        loop {
+            self.notify.notified().await;
+            if let Some(r) = self.result.lock().unwrap().as_ref() {
+                return Some(r.clone());
+            }
+        }
+    }
 }
 
 impl WorkspaceSession {
@@ -54,6 +93,7 @@ impl WorkspaceSession {
         Ok(Self {
             workspace: Arc::new(Mutex::new(workspace)),
             component_sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creation: Arc::new(Mutex::new(HashMap::new())),
             clangd_path,
             clangd_version,
             scanner,
@@ -65,17 +105,78 @@ impl WorkspaceSession {
         &self,
         build_dir: PathBuf,
     ) -> Result<Arc<ComponentSession>, ProjectError> {
-        let mut sessions = self.component_sessions.lock().await;
-
-        // Check if we already have a component session for this build directory
-        if let Some(component_session) = sessions.get(&build_dir) {
-            info!(
-                "Reusing existing ComponentSession for build dir: {}",
-                build_dir.display()
-            );
-            return Ok(Arc::clone(component_session));
+        // Fast path: reuse an existing session. The component_sessions lock is only
+        // held for the cache lookup, never across clangd startup, to avoid deadlocks
+        // when concurrent requests overlap.
+        {
+            let sessions = self.component_sessions.lock().await;
+            if let Some(component_session) = sessions.get(&build_dir) {
+                info!(
+                    "Reusing existing ComponentSession for build dir: {}",
+                    build_dir.display()
+                );
+                return Ok(Arc::clone(component_session));
+            }
         }
 
+        // In-flight dedup: if another request is already creating this session, wait
+        // for it rather than spawning a second clangd. The creator fills the shared
+        // slot and notifies when it finishes.
+        let existing = {
+            let pending = self.session_creation.lock().await;
+            pending.get(&build_dir).cloned()
+        };
+        if let Some(slot) = existing {
+            info!(
+                "Waiting for in-flight session creation for build dir: {}",
+                build_dir.display()
+            );
+            if let Some(session) = slot.await_result().await {
+                return session.map_err(ProjectError::SessionCreation);
+            }
+            // Creator ended without a result; fall through to create our own.
+        }
+
+        // Register ourselves as the creator so concurrent requests wait on us.
+        let slot = Arc::new(CreationSlot::new());
+        {
+            let mut pending = self.session_creation.lock().await;
+            if let Some(existing) = pending.get(&build_dir).cloned() {
+                // Lost the race: someone registered between our check and insert.
+                drop(pending);
+                if let Some(session) = existing.await_result().await {
+                    return session.map_err(ProjectError::SessionCreation);
+                }
+                // Fall back to creating our own if the winner produced nothing.
+                return self.create_component_session(&build_dir).await;
+            }
+            pending.insert(build_dir.clone(), Arc::clone(&slot));
+        }
+
+        // Perform the actual (now fast) session creation outside any creation lock.
+        let result = self.create_component_session(&build_dir).await;
+
+        // Publish the result and remove our in-flight registration.
+        // Publish the result and remove our in-flight registration.
+        let published = match &result {
+            Ok(session) => Some(Ok(Arc::clone(session))),
+            Err(e) => Some(Err(e.to_string())),
+        };
+        slot.store_result(published);
+        {
+            let mut pending = self.session_creation.lock().await;
+            pending.remove(&build_dir);
+        }
+
+        result
+    }
+
+    /// Create (and cache) a ComponentSession for a build directory.
+    /// Assumes the caller has already checked the cache and registered as creator.
+    async fn create_component_session(
+        &self,
+        build_dir: &PathBuf,
+    ) -> Result<Arc<ComponentSession>, ProjectError> {
         // Create a new component session for this build directory
         info!(
             "Creating new ComponentSession for build dir: {}",
@@ -85,7 +186,7 @@ impl WorkspaceSession {
         // Try to get the component from the workspace first
         let component = {
             let workspace = self.workspace.lock().await;
-            workspace.get_component_by_build_dir(&build_dir).cloned()
+            workspace.get_component_by_build_dir(build_dir).cloned()
         };
 
         let component = match component {
@@ -97,7 +198,7 @@ impl WorkspaceSession {
                     build_dir.display()
                 );
 
-                match self.scanner.discover_component(&build_dir)? {
+                match self.scanner.discover_component(build_dir)? {
                     Some(discovered_component) => {
                         // Add the discovered component to the workspace
                         let mut workspace = self.workspace.lock().await;
@@ -113,7 +214,7 @@ impl WorkspaceSession {
                         // component directly from a bare compile_commands.json. This supports
                         // build systems (GN, Bazel, xmake, ...) that export a compilation
                         // database but aren't recognized by any provider.
-                        match synthesize_component_from_compile_commands(&build_dir) {
+                        match synthesize_component_from_compile_commands(build_dir) {
                             Some(component) => {
                                 let mut workspace = self.workspace.lock().await;
                                 workspace.add_component(component.clone());
@@ -151,7 +252,6 @@ impl WorkspaceSession {
             }
         };
 
-        // Create ComponentSession
         let component_session = ComponentSession::new(
             component,
             &self.clangd_path,
@@ -162,13 +262,16 @@ impl WorkspaceSession {
 
         let component_session_arc = Arc::new(component_session);
 
-        // Store the component session for future reuse
-        sessions.insert(build_dir, Arc::clone(&component_session_arc));
-
-        // Drop sessions lock before returning
-        drop(sessions);
-
-        Ok(component_session_arc)
+        // Insert under the lock. If a concurrent request created a session for the
+        // same build dir while we were initializing ours, prefer the existing one
+        // and drop our duplicate.
+        let mut sessions = self.component_sessions.lock().await;
+        if let Some(existing) = sessions.get(build_dir) {
+            Ok(Arc::clone(existing))
+        } else {
+            sessions.insert(build_dir.clone(), Arc::clone(&component_session_arc));
+            Ok(component_session_arc)
+        }
     }
 
     /// Get a non-mutable reference to the project workspace
@@ -277,7 +380,7 @@ mod tests {
             "Dynamic discovery should have succeeded"
         );
         let session = component_session.unwrap();
-        assert_eq!(session.build_dir(), &test_project.build_dir);
+        assert_eq!(session.component().build_dir_path, test_project.build_dir);
 
         // Verify the component was added to the workspace
         {
@@ -356,7 +459,7 @@ mod tests {
             "Should succeed with existing component"
         );
         let session = component_session.unwrap();
-        assert_eq!(session.build_dir(), &test_project.build_dir);
+        assert_eq!(session.component().build_dir_path, test_project.build_dir);
 
         // Verify workspace still has exactly one component (not duplicated)
         {

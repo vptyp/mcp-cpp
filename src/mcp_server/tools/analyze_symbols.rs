@@ -25,7 +25,7 @@ use crate::mcp_server::tools::lsp_helpers::{
 };
 use crate::mcp_server::tools::utils;
 use crate::project::index::IndexStatusView;
-use crate::project::{ComponentSession, ProjectError, ProjectWorkspace};
+use crate::project::{ComponentSession, ProjectComponent, ProjectError};
 use crate::symbol::{FileLocation, Symbol};
 
 // ============================================================================
@@ -486,12 +486,12 @@ impl AnalyzeSymbolContextTool {
     /// V2 entry point - uses shared ClangdSession from server
     #[instrument(
         name = "analyze_symbol_context",
-        skip(self, component_session, _workspace)
+        skip(self, component_session, _component)
     )]
     pub async fn call_tool(
         &self,
         component_session: Arc<ComponentSession>,
-        _workspace: &ProjectWorkspace,
+        _component: &ProjectComponent,
     ) -> Result<CallToolResult, CallToolError> {
         info!(
             "Starting symbol analysis for '{}', location_hint={:?}, wait_timeout={:?}",
@@ -626,7 +626,8 @@ mod tests {
             .get_component_session(test_project.build_dir.clone())
             .await
             .unwrap();
-        let result = tool.call_tool(component_session, &workspace).await;
+        let component = component_session.component().clone();
+        let result = tool.call_tool(component_session, &component).await;
 
         // Check and log error if present
         if let Err(ref err) = result {
@@ -734,7 +735,8 @@ mod tests {
             .get_component_session(test_project.build_dir.clone())
             .await
             .unwrap();
-        let result = tool.call_tool(component_session, &workspace).await;
+        let component = component_session.component().clone();
+        let result = tool.call_tool(component_session, &component).await;
 
         assert!(result.is_ok());
 

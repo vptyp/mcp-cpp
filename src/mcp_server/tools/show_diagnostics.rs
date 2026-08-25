@@ -13,7 +13,7 @@ use tracing::{info, instrument, warn};
 
 use crate::mcp_server::tools::utils;
 use crate::project::index::IndexStatusView;
-use crate::project::{ComponentSession, ProjectWorkspace};
+use crate::project::{ComponentSession, ProjectComponent};
 
 /// Default timeout (seconds) to wait for clangd to publish diagnostics.
 const DEFAULT_DIAGNOSTICS_TIMEOUT_SECS: u64 = 20;
@@ -87,11 +87,11 @@ pub struct ShowDiagnosticsTool {
 }
 
 impl ShowDiagnosticsTool {
-    #[instrument(name = "show_diagnostics", skip(self, component_session, workspace))]
+    #[instrument(name = "show_diagnostics", skip(self, component_session, component))]
     pub async fn call_tool(
         &self,
         component_session: Arc<ComponentSession>,
-        workspace: &ProjectWorkspace,
+        component: &ProjectComponent,
     ) -> Result<CallToolResult, CallToolError> {
         let wait_timeout = self
             .wait_timeout
@@ -111,16 +111,6 @@ impl ShowDiagnosticsTool {
             "show_diagnostics",
         )
         .await;
-
-        // Get the component for this session's build directory
-        let build_dir = component_session.build_dir();
-        let component = workspace
-            .get_component_by_build_dir(build_dir)
-            .ok_or_else(|| {
-                CallToolError::new(std::io::Error::other(
-                    "Build directory not found in workspace",
-                ))
-            })?;
 
         // Resolve the file path to an absolute path using the project root
         let project_root = &component.source_root_path;

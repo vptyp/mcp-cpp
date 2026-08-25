@@ -48,8 +48,13 @@ impl IndexStatusView {
         start_time: Option<SystemTime>,
         state: String,
     ) -> Self {
-        let estimated_time_remaining =
-            Self::calculate_eta(indexed_files, total_files, start_time.as_ref(), in_progress);
+        let estimated_time_remaining = Self::calculate_eta(
+            progress_percentage,
+            indexed_files,
+            total_files,
+            start_time.as_ref(),
+            in_progress,
+        );
 
         Self {
             in_progress,
@@ -64,13 +69,16 @@ impl IndexStatusView {
 
     /// Calculate estimated time remaining based on current progress
     ///
-    /// Formula: ETA = (total_files - indexed_files) * elapsed_time / indexed_files
+    /// Prefers clangd's overall progress percentage (when available) because it
+    /// tracks the real index-build progress. Falls back to a file-count-based
+    /// estimate otherwise.
     ///
     /// Returns None if:
-    /// - No files indexed yet (can't divide by zero)
     /// - Not in progress
     /// - No start time available
+    /// - No progress at all (can't extrapolate)
     fn calculate_eta(
+        progress_percentage: Option<f32>,
         indexed_files: usize,
         total_files: usize,
         start_time: Option<&SystemTime>,
@@ -81,7 +89,27 @@ impl IndexStatusView {
             return None;
         }
 
-        // Can't calculate ETA if no files indexed (division by zero)
+        let start = start_time?;
+        let elapsed = SystemTime::now().duration_since(*start).ok()?;
+
+        // Avoid division by zero or negative elapsed time
+        if elapsed.is_zero() {
+            return None;
+        }
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        // Prefer the overall progress percentage (clangd's real progress). This is
+        // robust even when the per-file indexed count lags far behind the actual
+        // index build (which would otherwise produce absurd multi-day ETAs).
+        if let Some(pct) = progress_percentage {
+            let pct = pct.clamp(0.0, 100.0);
+            if pct > 0.0 {
+                let remaining_secs = elapsed_secs * (100.0 / pct as f64 - 1.0);
+                return Some(Duration::from_secs_f64(remaining_secs.max(0.0)));
+            }
+        }
+
+        // Fall back to the file-count-based estimate.
         if indexed_files == 0 {
             return None;
         }
@@ -91,17 +119,8 @@ impl IndexStatusView {
             return Some(Duration::ZERO);
         }
 
-        let start = start_time?;
-        let elapsed = SystemTime::now().duration_since(*start).ok()?;
-
-        // Avoid division by zero or negative elapsed time
-        if elapsed.is_zero() {
-            return None;
-        }
-
         // ETA formula: (total_files - indexed_files) * elapsed_time / indexed_files
         let remaining_files = total_files.saturating_sub(indexed_files);
-        let elapsed_secs = elapsed.as_secs_f64();
         let eta_seconds = (remaining_files as f64 * elapsed_secs) / (indexed_files as f64);
 
         Some(Duration::from_secs_f64(eta_seconds))

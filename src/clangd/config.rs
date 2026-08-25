@@ -134,8 +134,35 @@ pub struct ResourceConfig {
     /// Enable background indexing
     pub background_indexing: bool,
 
+    /// Where clangd keeps PCH/compiled preamble state.
+    /// `Memory` keeps everything resident in RAM (fast, but uses a lot of RAM).
+    pub pch_storage: PchStorage,
+
+    /// Number of parallel clangd worker/indexing threads.
+    /// `None` defaults to the number of available CPU cores.
+    pub index_threads: Option<u32>,
+
     /// Limit on number of concurrent clangd processes
     pub max_concurrent_processes: Option<u32>,
+}
+
+/// Where clangd keeps its preamble (PCH) storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PchStorage {
+    /// Keep preamble in memory. High RAM use, fastest queries.
+    Memory,
+    /// Persist preamble to disk. Lower RAM use.
+    Disk,
+}
+
+impl PchStorage {
+    /// The value accepted by clangd's `--pch-storage` flag.
+    pub fn as_clangd_arg(&self) -> &'static str {
+        match self {
+            PchStorage::Memory => "memory",
+            PchStorage::Disk => "disk",
+        }
+    }
 }
 
 /// Process priority levels
@@ -182,6 +209,8 @@ pub struct ResourceConfigBuilder {
     max_memory_mb: Option<u64>,
     process_priority: Option<ProcessPriority>,
     background_indexing: Option<bool>,
+    pch_storage: Option<PchStorage>,
+    index_threads: Option<u32>,
     max_concurrent_processes: Option<u32>,
 }
 
@@ -209,6 +238,8 @@ impl Default for ResourceConfig {
             max_memory_mb: None,
             process_priority: ProcessPriority::Normal,
             background_indexing: true,
+            pch_storage: PchStorage::Memory,
+            index_threads: None,
             max_concurrent_processes: None,
         }
     }
@@ -329,6 +360,18 @@ impl ClangdConfigBuilder {
     /// Enable or disable background indexing
     pub fn background_indexing(mut self, enabled: bool) -> Self {
         self.resource_config.background_indexing = Some(enabled);
+        self
+    }
+
+    /// Set where clangd keeps PCH/preamble storage (defaults to memory).
+    pub fn pch_storage(mut self, storage: PchStorage) -> Self {
+        self.resource_config.pch_storage = Some(storage);
+        self
+    }
+
+    /// Set the number of parallel clangd worker threads (defaults to core count).
+    pub fn index_threads(mut self, count: u32) -> Self {
+        self.resource_config.index_threads = Some(count);
         self
     }
 
@@ -539,6 +582,8 @@ impl ResourceConfigBuilder {
             background_indexing: self
                 .background_indexing
                 .unwrap_or(default.background_indexing),
+            pch_storage: self.pch_storage.unwrap_or(default.pch_storage),
+            index_threads: self.index_threads.or(default.index_threads),
             max_concurrent_processes: self.max_concurrent_processes,
         }
     }
@@ -557,14 +602,52 @@ impl Default for ClangdConfigBuilder {
 impl ClangdConfig {
     /// Get the full command-line arguments for clangd
     pub fn get_clangd_args(&self) -> Vec<String> {
+        // Point clangd at the project root when a compile_commands.json is reachable
+        // there (e.g. Chromium's `src/compile_commands.json -> out/chrome/...` symlink).
+        // This makes clangd's project root (and therefore its index cache) the project
+        // root rather than the build dir, so it reuses any existing `.cache/clangd/index`
+        // instead of reindexing from scratch. Fall back to the build dir when the root
+        // has no discoverable database.
+        let compile_commands_dir = if self
+            .working_directory
+            .join("compile_commands.json")
+            .exists()
+        {
+            self.working_directory.clone()
+        } else {
+            self.build_directory.clone()
+        };
+
         let mut args = vec![
             "--compile-commands-dir".to_string(),
-            self.build_directory.to_string_lossy().to_string(),
+            compile_commands_dir.to_string_lossy().to_string(),
         ];
 
-        // Add background indexing control
-        if !self.resource_config.background_indexing {
+        // Add background indexing control (explicitly enabled, not relying on clangd default)
+        if self.resource_config.background_indexing {
+            args.push("--background-index".to_string());
+        } else {
             args.push("--background-index=false".to_string());
+        }
+
+        // Keep preamble (PCH) storage in memory so index stays resident in RAM
+        args.push(format!(
+            "--pch-storage={}",
+            self.resource_config.pch_storage.as_clangd_arg()
+        ));
+
+        // Parallel async workers (also used by the background indexer). We use the
+        // short `-j` form instead of `--threads` because the latter is not accepted
+        // by all clangd builds (e.g. the VS Code bundled 22.1.0 rejects it), whereas
+        // `-j` is supported across versions. Default to available CPU cores.
+        let index_threads = self.resource_config.index_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(0)
+        });
+        if index_threads > 0 {
+            args.push("-j".to_string());
+            args.push(index_threads.to_string());
         }
 
         // Add memory limit if specified
@@ -697,6 +780,70 @@ mod tests {
         assert!(args.contains(&"--background-index=false".to_string()));
         assert!(args.contains(&"--log=verbose".to_string()));
         assert!(args.iter().any(|arg| arg.starts_with("--limit-results=")));
+    }
+
+    #[test]
+    fn test_clangd_args_background_index_memory_defaults() {
+        let temp_dir = tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build");
+        std::fs::create_dir(&build_dir).unwrap();
+        std::fs::write(build_dir.join("compile_commands.json"), "[]").unwrap();
+
+        // Default config: background indexing on, PCH in memory, threads = cores.
+        let config = ClangdConfigBuilder::new()
+            .working_directory(temp_dir.path())
+            .build_directory(&build_dir)
+            .build()
+            .unwrap();
+
+        let args = config.get_clangd_args();
+        assert!(args.contains(&"--background-index".to_string()));
+        assert!(args.contains(&"--pch-storage=memory".to_string()));
+        assert!(args.iter().any(|a| a == "-j"));
+        assert!(config.resource_config.pch_storage == PchStorage::Memory);
+
+        // Explicitly disable indexing + disk storage + fixed threads.
+        let config = ClangdConfigBuilder::new()
+            .working_directory(temp_dir.path())
+            .build_directory(&build_dir)
+            .background_indexing(false)
+            .pch_storage(PchStorage::Disk)
+            .index_threads(4)
+            .build()
+            .unwrap();
+        let args = config.get_clangd_args();
+        assert!(args.contains(&"--background-index=false".to_string()));
+        assert!(args.contains(&"--pch-storage=disk".to_string()));
+        assert!(args.windows(2).any(|w| w == ["-j", "4"]));
+    }
+
+    #[test]
+    fn test_compile_commands_dir_prefers_project_root_when_present() {
+        let temp_dir = tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build");
+        std::fs::create_dir(&build_dir).unwrap();
+        std::fs::write(build_dir.join("compile_commands.json"), "[]").unwrap();
+
+        // No compile_commands.json at the root -> fall back to the build dir.
+        let config = ClangdConfigBuilder::new()
+            .working_directory(temp_dir.path())
+            .build_directory(&build_dir)
+            .build()
+            .unwrap();
+        let args = config.get_clangd_args();
+        assert!(args.contains(&build_dir.to_string_lossy().to_string()));
+
+        // Root has a compile_commands.json (e.g. Chromium's symlink) -> use the root,
+        // so clangd's index cache lands at the project root and reuses existing index.
+        std::fs::write(temp_dir.path().join("compile_commands.json"), "[]").unwrap();
+        let config = ClangdConfigBuilder::new()
+            .working_directory(temp_dir.path())
+            .build_directory(&build_dir)
+            .build()
+            .unwrap();
+        let args = config.get_clangd_args();
+        assert!(args.contains(&temp_dir.path().to_string_lossy().to_string()));
+        assert!(!args.contains(&build_dir.to_string_lossy().to_string()));
     }
 
     #[test]

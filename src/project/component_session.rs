@@ -98,7 +98,6 @@ impl ComponentSession {
                 "--limit-results={}",
                 DEFAULT_WORKSPACE_SYMBOL_LIMIT
             ))
-            .add_arg("--query-driver=**")
             .add_arg("--log=verbose")
             .build()
             .map_err(|e| ProjectError::SessionCreation(format!("Failed to build config: {}", e)))?;
@@ -195,8 +194,10 @@ impl ComponentSession {
         // Create IndexTrigger from the provided clangd session and file manager
         let index_trigger = Arc::new(ClangdIndexTrigger::new(session, file_manager));
 
-        // Create new ComponentIndexMonitor with IndexTrigger
-        let monitor = ComponentIndexMonitor::new_with_trigger(
+        // Create new ComponentIndexMonitor with IndexTrigger. The initial disk scan
+        // is deferred to a background task (see below) so that session creation
+        // returns quickly and the session can be cached/reused immediately.
+        let monitor = ComponentIndexMonitor::new_with_trigger_no_scan(
             build_dir.to_path_buf(),
             compilation_database.clone(),
             index_reader,
@@ -205,8 +206,16 @@ impl ComponentSession {
         )
         .await?;
 
-        // Trigger initial indexing using the ComponentIndexMonitor
-        if let Err(e) = monitor
+        let monitor_arc = Arc::new(monitor);
+
+        // Deliberately do NOT run an in-process scan of the on-disk .idx files here:
+        // clangd itself loads the existing index into RAM via --background-index and
+        // reports progress via $/progress (overall begin/report/end). Re-parsing all
+        // ~100k idx files inside the server would duplicate clangd's work, consume
+        // gigabytes and every CPU core, and starve the clangd child. Instead we only
+        // kick off indexing (opens one file) and let clangd drive the completion
+        // latch. Searches wait on that latch, bounded by the tool's wait_timeout.
+        if let Err(e) = monitor_arc
             .trigger_initial_indexing(compilation_database.clone())
             .await
         {
@@ -216,8 +225,6 @@ impl ComponentSession {
                 e
             );
         }
-
-        let monitor_arc = Arc::new(monitor);
 
         debug!(
             "Created ComponentIndexMonitor for build dir: {}",
@@ -278,8 +285,9 @@ impl ComponentSession {
     }
 
     /// Get the build directory for this component
-    pub fn build_dir(&self) -> &PathBuf {
-        &self.build_dir
+    /// Get the component associated with this session.
+    pub fn component(&self) -> &ProjectComponent {
+        &self.component
     }
 
     /// Wait for indexing completion before proceeding with LSP operations
