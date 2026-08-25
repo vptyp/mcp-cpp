@@ -1,11 +1,8 @@
 # C++ MCP Server
 
-[![CI](https://github.com/mpsm/mcp-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/mpsm/mcp-cpp/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/mpsm/mcp-cpp)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2024%2B-orange.svg)](https://www.rust-lang.org)
-[![Crates.io](https://img.shields.io/crates/v/mcp-cpp-server?label=crates.io)](https://crates.io/crates/mcp-cpp-server)
-
 A Model Context Protocol (MCP) server that provides C++ code analysis capabilities through clangd LSP integration. Enables AI agents to work with C++ codebases using semantic understanding similar to modern IDEs.
+
+This is a fork of [mpsm/mcp-cpp](https://github.com/mpsm/mcp-cpp).
 
 ## Why This MCP Server?
 
@@ -25,38 +22,63 @@ The implementation works with both CMake and Meson projects, handling projects w
 
 ## Component Discovery
 
-The MCP server automatically looks for components in the current working directory, scanning 2 levels below by default. This scan depth can be changed using tool options. When an AI agent requests analysis using a build directory outside the project, the MCP server will use that hint path and create a component from it, allowing flexible project analysis beyond the default scanning scope.
+The MCP server automatically looks for components in the current working directory, scanning 3 levels below by default. This scan depth can be changed using tool options. When an AI agent requests analysis using a build directory outside the project, the MCP server will use that hint path and create a component from it, allowing flexible project analysis beyond the default scanning scope.
+
+## Repository Structure
+
+This fork follows the layout below:
+
+```
+├── src/                    # Rust server
+│   ├── clangd/             #   clangd LSP integration (session, config, index)
+│   ├── lsp/                #   LSP protocol client (JSON-RPC, framing)
+│   ├── project/            #   build-system discovery (CMake, Meson, compile_commands)
+│   ├── mcp_server/         #   MCP tools (search, analyze, diagnostics, index status)
+│   └── io/                 #   process and transport management
+├── tools/
+│   └── lsp-cli.py          # standalone Python CLI (stdlib only, no deps)
+├── test/                   # test projects + Node.js E2E framework
+├── docs/                   # design notes (clangd index spec, symbol analysis)
+├── docker/ + Dockerfile    # container packaging
+└── .github/workflows/      # CI + release (pre-built binaries per platform)
+```
 
 ## Dependencies
 
-The server requires clangd 11 or later for C++ semantic analysis (clangd 20+ recommended), and Rust 2024 edition for building. Your project must use CMake or Meson to generate compilation databases (`compile_commands.json`).
+The server requires clangd 11 or later for C++ semantic analysis (clangd 20+ recommended). Your project must generate a compilation database (`compile_commands.json`): CMake and Meson are auto-detected, and any other build system that exports one (GN/ninja, Bazel, ...) works through the project-root `compile_commands.json` fallback. The Python CLI needs only the Python 3 standard library.
 
 You can optionally set the `CLANGD_PATH` environment variable to specify a custom clangd binary location.
 
 ## Installation
 
-### Install from Crates.io (Recommended)
+The server is a single self-contained binary. You do **not** need Rust or cargo on the machine that runs it — build it once (or download a pre-built binary) and copy it wherever you need it.
+
+### Download a Pre-Built Binary (no cargo needed)
+
+Pre-built binaries for Linux (x86_64 / aarch64) and macOS (x86_64 / aarch64) are attached to each [GitHub release](https://github.com/vptyp/mcp-cpp/releases):
 
 ```bash
-# Install directly from the registry
-cargo install mcp-cpp-server
-
-# The binary will be available in your cargo bin directory
-# (usually ~/.cargo/bin/mcp-cpp-server)
+# Example: Linux x86_64
+curl -L -o mcp-cpp-server \
+  https://github.com/vptyp/mcp-cpp/releases/latest/download/mcp-cpp-server-linux-x86_64
+chmod +x mcp-cpp-server
+./mcp-cpp-server --help
 ```
 
-### Install from Source
+### Build Directly from Source
+
+Build on any machine with cargo, then run the binary directly — no install step, no cargo on the target machine:
 
 ```bash
-# Clone the repository
-git clone https://github.com/mpsm/mcp-cpp.git
+# Clone the fork
+git clone git@github.com:vptyp/mcp-cpp.git
 cd mcp-cpp
 
-# Install from source
-cargo install --path .
+# Compile the release binary
+cargo build --release
 
-# The binary will be available in your cargo bin directory
-# (usually ~/.cargo/bin/mcp-cpp-server)
+# The binary is self-contained; copy it to machines without cargo:
+./target/release/mcp-cpp-server --help
 ```
 
 ### Docker Installation
@@ -136,7 +158,7 @@ Claude Code uses a different configuration file location and requires explicit p
   "mcpServers": {
     "cpp": {
       "type": "stdio",
-      "command": "~/.cargo/bin/mcp-cpp-server",
+      "command": "/path/to/mcp-cpp/target/release/mcp-cpp-server",
       "args": [],
       "env": {
         "CLANGD_PATH": "/opt/homebrew/opt/llvm/bin/clangd"
@@ -157,7 +179,7 @@ Claude Code uses a different configuration file location and requires explicit p
 **Notes:**
 - Claude Code reads `~/.claude.json`, not `~/.claude/mcp_servers.json`
 - The `permissions` section is required to enable the MCP tools
-- Adjust the `command` path to match your cargo installation (use `which mcp-cpp-server` to find it)
+- Adjust the `command` path to wherever you placed the binary (e.g. `target/release/mcp-cpp-server` after building, or a downloaded release binary)
 - Adjust `CLANGD_PATH` to your clangd installation (use `which clangd` to find it, or omit if clangd is in your PATH)
 - Tools are prefixed with `mcp__cpp__` in Claude Code (e.g., `mcp__cpp__search_symbols`)
 
@@ -266,8 +288,8 @@ source tree, so binding it to a routable address should be a deliberate act.
 The Python CLI helps you understand what your AI agent sees from the MCP server, making it useful for debugging interactions. It needs only the Python standard library. Note that this tool is not included in the distributed package and must be used directly from the repository:
 
 ```bash
-# Clone the repository if you haven't already
-git clone https://github.com/mpsm/mcp-cpp.git
+# Clone the fork if you haven't already
+git clone git@github.com:vptyp/mcp-cpp.git
 cd mcp-cpp
 
 # Discover build directories and see the resolved configuration
@@ -285,8 +307,8 @@ python3 tools/lsp-cli.py search "" --files include/api.h
 # Analyze a symbol with examples
 python3 tools/lsp-cli.py analyze MyClass::process
 
-# Show clangd diagnostics (errors/warnings) for a source file
-python3 tools/lsp-cli.py diagnostics src/main.cpp
+# Show clangd diagnostics (errors/warnings) for one or more source files
+python3 tools/lsp-cli.py diagnostics src/main.cpp src/util.cpp
 
 # Machine-readable output for scripting
 python3 tools/lsp-cli.py --format json search MyClass
