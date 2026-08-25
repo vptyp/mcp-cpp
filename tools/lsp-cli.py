@@ -703,7 +703,7 @@ examples:
   lsp-cli.py search Buffer --kind Class Struct   restrict the search to types
   lsp-cli.py search "" --files src/main.cpp      list every symbol defined in one file
   lsp-cli.py analyze Math::factorial             definition, callers, members and usages
-  lsp-cli.py diagnostics src/main.cpp            compiler errors and warnings for one file
+  lsp-cli.py diagnostics src/main.cpp src/util.cpp  compiler errors and warnings for one or more files
 
 output:
   YAML on stdout. Errors go to stderr and exit non-zero.
@@ -849,9 +849,12 @@ def create_parser() -> argparse.ArgumentParser:
     diagnostics = commands.add_parser(
         "diagnostics",
         aliases=["show-diagnostics"],
-        help="Show clangd errors, warnings and notes for one source file",
+        help="Show clangd errors, warnings and notes for one or more source files",
     )
-    diagnostics.add_argument("file", help="Source file to check. Relative paths resolve against the project root.")
+    diagnostics.add_argument(
+        "file", nargs="+",
+        help="Source file(s) to check. Relative paths resolve against the project root.",
+    )
     _add_build_directory(diagnostics)
     _add_wait_timeout(diagnostics, "clangd to report")
 
@@ -908,6 +911,13 @@ def build_tool_arguments(tool: str, args: argparse.Namespace) -> Dict:
     return arguments
 
 
+def _with_file(args: argparse.Namespace, file: str) -> argparse.Namespace:
+    """Shallow copy of args with the diagnostics file replaced."""
+    copy = argparse.Namespace(**vars(args))
+    copy.file = file
+    return copy
+
+
 def create_client(args: argparse.Namespace, config: Dict) -> "McpClient":
     """Pick a transport: explicit HTTP, cached HTTP, attached FIFO, or spawn."""
     http_url = args.http_url or config.get("http_url")
@@ -933,7 +943,17 @@ def run(args: argparse.Namespace) -> int:
     client = create_client(args, config)
 
     tool = _TOOL_FOR_COMMAND[args.command]
-    response = client.call_tool(tool, build_tool_arguments(tool, args))
+
+    # Diagnostics accepts one or more files: call the tool once per file and
+    # aggregate, so one invocation covers a whole change set. _with_file sets
+    # a single string (the server expects a string, not a list).
+    if args.command in ("diagnostics", "show-diagnostics"):
+        responses = [
+            client.call_tool(tool, build_tool_arguments(tool, _with_file(args, f)))
+            for f in args.file
+        ]
+    else:
+        responses = [client.call_tool(tool, build_tool_arguments(tool, args))]
 
     # Cache the HTTP session next to the project root, not the current
     # directory, so running from a subdirectory does not scatter config files.
@@ -952,21 +972,26 @@ def run(args: argparse.Namespace) -> int:
         )
 
     if args.format == "raw":
-        print(json.dumps(response, indent=2))
-        return 0 if not _is_tool_error(response) else 1
+        print(json.dumps(responses if len(responses) > 1 else responses[0], indent=2))
+        return 0 if not any(_is_tool_error(r) for r in responses) else 1
 
     # A tool that fails reports it in the result rather than as a JSON-RPC
     # error, so check for it explicitly; otherwise the message would be
     # printed as if it were data and the exit code would claim success.
-    if _is_tool_error(response):
-        raise McpCliError(_error_text(response))
+    failed = [r for r in responses if _is_tool_error(r)]
+    if failed:
+        raise McpCliError(_error_text(failed[0]))
 
-    payload = extract_payload(response)
+    payloads = [extract_payload(r) for r in responses]
     if args.format == "json":
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(payloads if len(payloads) > 1 else payloads[0], indent=2))
         return 0
 
-    print(to_yaml(shape_payload(payload, _project_root(config_path))))
+    shaped = [shape_payload(p, _project_root(config_path)) for p in payloads]
+    if len(shaped) > 1:
+        print(to_yaml(shaped))
+    else:
+        print(to_yaml(shaped[0]))
     return 0
 
 
