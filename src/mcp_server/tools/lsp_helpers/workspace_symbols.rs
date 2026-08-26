@@ -127,12 +127,18 @@ impl WorkspaceSymbolFilter for SymbolKindFilter {
     }
 }
 
-/// Filter for symbol names using substring matching
+/// Filter for symbol names using substring matching.
+///
+/// Test-only: the workspace search path no longer applies a client-side name
+/// filter (it trusts clangd's `workspace/symbol` fuzzy match). Retained for
+/// unit-testing the filter iterator plumbing.
+#[cfg(test)]
 pub struct NameFilter {
     query: String,
     case_sensitive: bool,
 }
 
+#[cfg(test)]
 impl NameFilter {
     pub fn new(query: String, case_sensitive: bool) -> Self {
         Self {
@@ -142,6 +148,7 @@ impl NameFilter {
     }
 }
 
+#[cfg(test)]
 impl WorkspaceSymbolFilter for NameFilter {
     fn matches(&self, symbol: &WorkspaceSymbol) -> bool {
         if self.case_sensitive {
@@ -210,6 +217,10 @@ pub struct WorkspaceSymbolSearchBuilder {
     kinds: Option<Vec<lsp_types::SymbolKind>>,
     max_results: Option<u32>,
     include_external: bool,
+    // Vestigial: case-sensitive client-side name filtering was removed from the
+    // workspace search path (see `search`). Retained for builder-API compatibility
+    // and the builder unit test; no longer consulted at query time.
+    #[allow(dead_code)]
     case_sensitive: bool,
 }
 
@@ -283,9 +294,14 @@ impl WorkspaceSymbolSearchBuilder {
             filtered_iter = filtered_iter.with_filter(SymbolKindFilter::new(kinds.clone()));
         }
 
-        // Add name filter for additional refinement (beyond clangd's initial filtering)
-        filtered_iter =
-            filtered_iter.with_filter(NameFilter::new(self.query.clone(), self.case_sensitive));
+        // NOTE: we deliberately do NOT apply a client-side name (substring) filter
+        // here. clangd's `workspace/symbol` already fuzzy-matches the query against
+        // each symbol's *qualified* name (e.g. `infobars::InfoBar::Show`), so a
+        // query like `InfoBar::Show` correctly resolves. A substring filter on the
+        // *bare* name (`Show`) would reject clangd's own top hit for any scoped
+        // query (`"Show".contains("InfoBar::Show")` is false) and silently return 0
+        // results. Trusting clangd's ranking matches what `analyze_symbol_context`
+        // does. Project-boundary and kind filtering still apply below clangd's pass.
 
         // Collect results with optional limit
         let results: Vec<WorkspaceSymbol> = if let Some(max) = self.max_results {
