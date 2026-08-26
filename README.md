@@ -12,13 +12,12 @@ This MCP server bridges that gap by providing AI agents with semantic analysis c
 
 The server can handle multiple C++ projects simultaneously, which is particularly useful for complex scenarios like embedded Linux development where understanding interactions between individual components is crucial. It supports both CMake and Meson build systems with automatic build directory detection and switching.
 
-Advanced indexing monitoring tracks both clangd's index state and logs to ensure complete symbol coverage, while intelligent filtering distinguishes between project code and external dependencies.
 
 ## Features
 
-The server provides five core analysis tools for C++ development. The `get_project_details` tool performs dynamic CMake and Meson build environment discovery, enables configuration switching, and reports the configuration the server resolved. For symbol exploration, `search_symbols` offers C++ symbol search with project boundary detection and intelligent filtering. When deeper analysis is needed, `analyze_symbol_context` provides symbol analysis with inheritance and call hierarchy support. For code health, `show_diagnostics` retrieves clangd's compile errors, warnings, and notes for a specific source file. And `get_index_status` reports how far clangd has got building its index, which matters on large trees where the first useful answer has to wait for indexing.
+The server provides five core analysis tools for C++ development. The `get_project_details` tool performs dynamic CMake and Meson build environment discovery and reports the configuration it resolved. `get_index_status` forwards clangd's reported indexing state. For symbol exploration, `search_symbols` offers C++ symbol search with project boundary detection and filtering. For deeper analysis, `analyze_symbol_context` provides inheritance and call hierarchy support. For code health, `show_diagnostics` retrieves clangd's compile errors, warnings, and notes for a specific source file.
 
-The implementation works with both CMake and Meson projects, handling projects with multiple libraries and executables simultaneously. Advanced indexing monitors clangd's index state and logs to ensure complete symbol coverage, while intelligent filtering distinguishes between project code and external dependencies. The server automatically discovers and switches between build configurations, and includes a Python CLI tool for quick symbol exploration.
+The implementation works with both CMake and Meson projects, handles multiple libraries and executables, automatically discovers build configurations, and includes a Python CLI for symbol exploration.
 
 ## Component Discovery
 
@@ -249,7 +248,7 @@ clangd:
   workspace_symbol_limit: 1000  # --limit-results
   initialization_timeout: 30s   # wait for clangd to answer `initialize`
   request_timeout: 30s          # bound on every LSP request
-  index_wait_timeout: 20s       # default for tools' `wait_timeout`
+  index_wait_timeout: 20s       # bound on clangd index-progress waits
 
 project:
   scan_depth: 3                 # how deep to look for build directories
@@ -294,9 +293,6 @@ cd mcp-cpp
 
 # Discover build directories and see the resolved configuration
 python3 tools/lsp-cli.py project
-
-# Check how far clangd has got indexing
-python3 tools/lsp-cli.py index
 
 # Search for symbols (see what the agent would see)
 python3 tools/lsp-cli.py search MyClass
@@ -435,23 +431,6 @@ The server also assists with development workflows by enabling switching between
 
 **Component Discovery**: By default, scans 3 levels below the project root for components. When AI agents specify build directories outside this scope, the server creates components from those hint paths automatically.
 
-#### `get_index_status`
-
-**Purpose**: Report clangd's indexing progress for a build directory without running a search
-
-**Options**:
-- `build_directory` (optional): Build directory to report on. Defaults to the auto-detected one
-- `wait_timeout` (optional): Seconds to wait for indexing to finish before answering (default: 0, answer immediately)
-
-**Output**: Whether indexing is in progress, percentage complete, files indexed vs total, and an estimated time remaining.
-
-Cheap enough to poll. On a tree that was already indexed in a previous run, clangd reports no progress at all — there is no work for it to announce — so the server reconciles against the index on disk in the background and reports `Completed` once it has. While that reconciliation is still running the response carries `scan_in_progress: true`, meaning the counts are provisional rather than final.
-
-```bash
-get_index_status {}
-get_index_status {"build_directory": "/path/to/build", "wait_timeout": 300}
-```
-
 #### `search_symbols`
 
 **Purpose**: Find C++ symbols across your codebase or get complete API overviews
@@ -538,4 +517,3 @@ show_diagnostics {"file": "src/main.cpp", "build_directory": "/path/to/build", "
 ## Limitations
 
 - Requires CMake or Meson projects that generate `compile_commands.json`
-- First-time indexing can take time on large projects (configurable timeout, default 20s)

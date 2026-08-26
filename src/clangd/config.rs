@@ -46,11 +46,7 @@ pub const MAX_INITIALIZATION_TIMEOUT_SECS: u64 = 300;
 /// caps its memory use, so there is nothing for a megabyte figure to control.
 pub const DEFAULT_WORKSPACE_SYMBOL_LIMIT: u32 = 1000;
 
-/// Default timeout for waiting for indexing completion (20 seconds)
-///
-/// This is the default time to wait for clangd to complete indexing before
-/// proceeding with LSP operations. Tools can override this with wait_timeout parameter.
-/// Setting this to 0 means no waiting for indexing (immediate response with status).
+/// Default bound for waiting on clangd's own background-index notifications.
 pub const DEFAULT_INDEX_WAIT_TIMEOUT_SECS: u64 = 20;
 
 // ============================================================================
@@ -610,19 +606,8 @@ impl Default for ClangdConfigBuilder {
 impl ClangdConfig {
     /// Directory passed to clangd via `--compile-commands-dir`.
     ///
-    /// Point clangd at the project root when a compile_commands.json is reachable
-    /// there (e.g. Chromium's `src/compile_commands.json -> out/chrome/...` symlink).
-    /// This makes clangd's project root (and therefore its index cache) the project
-    /// root rather than the build dir, so it reuses any existing `.cache/clangd/index`
-    /// instead of reindexing from scratch. Fall back to the build dir when the root
-    /// has no discoverable database.
-    ///
-    /// This is the single source of truth for the layout decision: everything that
-    /// needs to know where clangd reads its database or writes its index must go
-    /// through this function or [`index_directory`](Self::index_directory), never
-    /// re-derive it. The two answers diverge exactly in the root-database layout,
-    /// and a second derivation that guesses "build dir" there silently reads an
-    /// index directory clangd never writes to.
+    /// Prefer a compilation database at the project root; otherwise use the build
+    /// directory supplied by the selected component.
     pub fn resolve_compile_commands_dir(
         working_directory: &Path,
         build_directory: &Path,
@@ -634,26 +619,9 @@ impl ClangdConfig {
         }
     }
 
-    /// Directory clangd writes its on-disk index shards to.
-    ///
-    /// clangd anchors `.cache/clangd/index` at the compilation-database directory,
-    /// so this must be derived from [`resolve_compile_commands_dir`](Self::resolve_compile_commands_dir)
-    /// rather than from the build directory.
-    pub fn resolve_index_directory(working_directory: &Path, build_directory: &Path) -> PathBuf {
-        Self::resolve_compile_commands_dir(working_directory, build_directory)
-            .join(".cache")
-            .join("clangd")
-            .join("index")
-    }
-
     /// Directory this configuration passes to clangd via `--compile-commands-dir`.
     pub fn compile_commands_dir(&self) -> PathBuf {
         Self::resolve_compile_commands_dir(&self.working_directory, &self.build_directory)
-    }
-
-    /// Directory clangd will write its index shards to under this configuration.
-    pub fn index_directory(&self) -> PathBuf {
-        Self::resolve_index_directory(&self.working_directory, &self.build_directory)
     }
 
     /// Get the full command-line arguments for clangd
@@ -885,55 +853,6 @@ mod tests {
         let args = config.get_clangd_args();
         assert!(args.contains(&temp_dir.path().to_string_lossy().to_string()));
         assert!(!args.contains(&build_dir.to_string_lossy().to_string()));
-    }
-
-    /// The index directory must track `--compile-commands-dir`, not the build dir.
-    ///
-    /// These two answers are identical in the ordinary layout and diverge only when
-    /// the project root carries its own `compile_commands.json`. That divergence is
-    /// exactly the bug this pins: a second derivation that assumes "build dir" would
-    /// point the index reader at a directory clangd never writes to, so every shard
-    /// looks missing and the whole component reports as unindexed forever.
-    #[test]
-    fn test_index_directory_follows_compile_commands_dir() {
-        let temp_dir = tempdir().unwrap();
-        let root = temp_dir.path();
-        let build_dir = root.join("build");
-        std::fs::create_dir(&build_dir).unwrap();
-        std::fs::write(build_dir.join("compile_commands.json"), "[]").unwrap();
-
-        let cache_suffix = Path::new(".cache").join("clangd").join("index");
-
-        // Build-directory layout: index lands under the build dir.
-        let config = ClangdConfigBuilder::new()
-            .working_directory(root)
-            .build_directory(&build_dir)
-            .build()
-            .unwrap();
-        assert_eq!(config.compile_commands_dir(), build_dir);
-        assert_eq!(config.index_directory(), build_dir.join(&cache_suffix));
-
-        // Root-database layout: index must follow the root, not the build dir.
-        std::fs::write(root.join("compile_commands.json"), "[]").unwrap();
-        let config = ClangdConfigBuilder::new()
-            .working_directory(root)
-            .build_directory(&build_dir)
-            .build()
-            .unwrap();
-        assert_eq!(config.compile_commands_dir(), root);
-        assert_eq!(config.index_directory(), root.join(&cache_suffix));
-        assert_ne!(config.index_directory(), build_dir.join(&cache_suffix));
-
-        // And the directory we hand the index reader is the one we handed clangd.
-        let args = config.get_clangd_args();
-        let flag = args
-            .iter()
-            .position(|a| a == "--compile-commands-dir")
-            .unwrap();
-        assert_eq!(
-            config.index_directory(),
-            Path::new(&args[flag + 1]).join(&cache_suffix)
-        );
     }
 
     #[test]

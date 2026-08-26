@@ -148,18 +148,15 @@ impl McpToolHandler<GetIndexStatusTool> for CppServerHandler {
         let build_dir = self
             .resolve_build_directory(tool.build_directory.as_deref())
             .await?;
-
         let component_session = self
             .workspace_session
             .get_component_session(build_dir)
             .await
             .map_err(|e| {
                 CallToolError::new(std::io::Error::other(format!(
-                    "ComponentSession creation failed: {}",
-                    e
+                    "ComponentSession creation failed: {e}"
                 )))
             })?;
-
         let component = component_session.component().clone();
         tool.call_tool(component_session, &component).await
     }

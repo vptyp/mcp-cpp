@@ -9,7 +9,6 @@ pub mod compilation_database;
 pub mod component;
 pub mod component_session;
 pub mod error;
-pub mod index;
 pub mod meson_provider;
 pub mod provider;
 pub mod scanner;

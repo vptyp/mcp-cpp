@@ -80,7 +80,7 @@ pub struct ClangdSettings {
     pub initialization_timeout: Duration,
     /// Budget for an individual LSP request.
     pub request_timeout: Duration,
-    /// Default time tools wait for indexing before answering anyway.
+    /// Bound for waiting on clangd's LSP index progress.
     pub index_wait_timeout: Duration,
 }
 
@@ -426,14 +426,11 @@ mod tests {
             Path::new("/proj"),
             &CliOverrides::default(),
             &MapEnv::empty(),
-            parse(
-                "clangd:\n  request_timeout: 90s\n  initialization_timeout: 2m\n  index_wait_timeout: 500ms\n",
-            ),
+            parse("clangd:\n  request_timeout: 90s\n  initialization_timeout: 2m\n"),
         );
 
         assert_eq!(cfg.clangd.request_timeout, Duration::from_secs(90));
         assert_eq!(cfg.clangd.initialization_timeout, Duration::from_secs(120));
-        assert_eq!(cfg.clangd.index_wait_timeout, Duration::from_millis(500));
     }
 
     /// `index_threads` is doubly optional: absent means "leave the default",

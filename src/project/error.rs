@@ -38,10 +38,4 @@ pub enum ProjectError {
 
     #[error("Session not found: {0}")]
     SessionNotFound(String),
-
-    #[error("Indexing timeout: {0}")]
-    IndexingTimeout(String),
-
-    #[error("Indexing trigger failed: {0}")]
-    IndexingTrigger(String),
 }

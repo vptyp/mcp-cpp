@@ -300,7 +300,6 @@ pub mod test_helpers {
         crate::lsp::testing::MockLspClientTrait,
     > {
         use crate::clangd::file_manager::ClangdFileManager;
-        use crate::clangd::index::IndexProgressMonitor;
         use crate::io::process::MockProcessManager;
         use crate::lsp::testing::MockLspClientTrait;
 
@@ -319,16 +318,7 @@ pub mod test_helpers {
             .expect_open_text_document()
             .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
         let _file_manager = ClangdFileManager::new();
-        let index_progress_monitor = IndexProgressMonitor::new();
-        let log_monitor = crate::clangd::log_monitor::LogMonitor::new();
-
-        super::super::session::ClangdSession::with_dependencies(
-            config,
-            mock_process,
-            mock_lsp,
-            index_progress_monitor,
-            log_monitor,
-        )
+        super::super::session::ClangdSession::with_dependencies(config, mock_process, mock_lsp)
     }
 
     /// Create a configured TestProject and ClangdSession for integration tests

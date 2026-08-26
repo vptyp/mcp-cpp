@@ -92,7 +92,7 @@ pub struct ClangdSection {
     /// Budget for an individual LSP request, e.g. `30s`.
     #[serde(default, with = "humantime_serde::option")]
     pub request_timeout: Option<Duration>,
-    /// Default time tools wait for indexing, e.g. `20s`.
+    /// Bound for waiting on clangd's own index-progress notifications, e.g. `20s`.
     #[serde(default, with = "humantime_serde::option")]
     pub index_wait_timeout: Option<Duration>,
 }
@@ -221,7 +221,6 @@ clangd:
   workspace_symbol_limit: 2000
   initialization_timeout: 45s
   request_timeout: 1m
-  index_wait_timeout: 5s
 project:
   scan_depth: 4
   skip_hidden: false

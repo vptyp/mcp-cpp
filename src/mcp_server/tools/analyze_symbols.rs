@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
+use crate::clangd::progress::IndexStatus;
 use crate::io::file_buffer::FileBufferError;
 use crate::mcp_server::tools::lsp_helpers::{
     call_hierarchy::{CallHierarchy, get_call_hierarchy},
@@ -24,7 +25,6 @@ use crate::mcp_server::tools::lsp_helpers::{
     type_hierarchy::{TypeHierarchy, get_type_hierarchy},
 };
 use crate::mcp_server::tools::utils;
-use crate::project::index::IndexStatusView;
 use crate::project::{ComponentSession, ProjectComponent, ProjectError};
 use crate::symbol::{FileLocation, Symbol};
 
@@ -139,7 +139,6 @@ impl From<AnalyzerError> for CallToolError {
                    • build_directory: Optional - STRONGLY PREFER absolute paths from get_project_details
                    • max_examples: Optional number - limits the number of usage examples (unlimited by default)
                    • location_hint: Optional string - location hint for disambiguating overloaded symbols (format: \"/path/file.cpp:line:column\")
-                   • wait_timeout: Optional number - timeout for indexing completion in seconds (default: 20s, 0 = no wait)
 
                    AUTOMATIC ANALYSIS (no flags required):
                    Inheritance hierarchy, call relationships, and usage patterns are automatically included when applicable based on symbol type."
@@ -218,7 +217,8 @@ pub struct AnalyzeSymbolContextTool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location_hint: Option<String>,
 
-    /// Timeout in seconds to wait for indexing completion (default: 20s, 0 = no wait)
+    /// Seconds to wait for clangd's current indexing pass (default: 20, 0 = immediate).
+    #[cfg_attr(test, allow(dead_code))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_timeout: Option<u64>,
 }
@@ -254,9 +254,8 @@ pub struct AnalyzerResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<Members>,
 
-    /// Index status information when timeout occurred or no indexing wait
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_status: Option<IndexStatusView>,
+    pub index_status: Option<IndexStatus>,
 }
 
 impl AnalyzeSymbolContextTool {
@@ -498,16 +497,10 @@ impl AnalyzeSymbolContextTool {
             self.symbol, self.location_hint, self.wait_timeout
         );
 
-        // Selective indexing wait logic based on location_hint
-        let index_status = utils::handle_selective_indexing_wait(
+        let index_status = utils::wait_for_clangd_index(
             &component_session,
-            self.location_hint.is_some(), // Skip indexing for document-specific analysis (location hint provided)
+            self.location_hint.is_some(),
             self.wait_timeout,
-            if self.location_hint.is_some() {
-                "Document-specific analysis"
-            } else {
-                "Workspace symbol resolution"
-            },
         )
         .await;
 

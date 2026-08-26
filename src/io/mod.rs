@@ -17,5 +17,5 @@ pub mod transport;
 // Re-export main types for convenience
 #[allow(dead_code, unused_imports)]
 pub use file_buffer::{FileBuffer, FileBufferError, FilePosition};
-pub use process::{ChildProcessManager, ProcessManager, StderrMonitor, StopMode};
+pub use process::{ChildProcessManager, ProcessManager, StopMode};
 pub use transport::StdioTransport;

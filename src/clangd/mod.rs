@@ -37,11 +37,9 @@ pub mod config;
 pub mod diagnostics;
 pub mod error;
 pub mod file_manager;
-pub mod index;
-pub mod log_monitor;
+pub mod progress;
 pub mod session;
 pub mod session_builder;
-pub mod version;
 
 #[cfg(test)]
 pub mod testing;

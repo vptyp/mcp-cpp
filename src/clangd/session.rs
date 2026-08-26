@@ -10,10 +10,9 @@ use tracing::{debug, info, warn};
 
 use crate::clangd::config::ClangdConfig;
 use crate::clangd::error::ClangdSessionError;
-use crate::clangd::index::IndexProgressMonitor;
-use crate::clangd::log_monitor::LogMonitor;
+use crate::clangd::progress::IndexProgressMonitor;
 use crate::clangd::session_builder::ClangdSessionBuilder;
-use crate::io::{ChildProcessManager, ProcessManager, StderrMonitor, StdioTransport, StopMode};
+use crate::io::{ChildProcessManager, ProcessManager, StdioTransport, StopMode};
 use crate::lsp::{LspClient, traits::LspClientTrait};
 
 /// Type alias for testing sessions with mock dependencies
@@ -81,11 +80,7 @@ where
     /// LSP client (injected dependency)
     lsp_client: Box<C>,
 
-    /// Indexing progress monitor
     index_progress_monitor: IndexProgressMonitor,
-
-    /// Log monitor for stderr parsing
-    log_monitor: LogMonitor,
 
     /// Session start timestamp
     started_at: Instant,
@@ -100,12 +95,20 @@ where
     ///
     /// This constructor enables dependency injection of both ProcessManager and LspClient,
     /// making the session fully unit testable without external processes.
-    pub fn with_dependencies(
+    pub fn with_dependencies(config: ClangdConfig, process_manager: P, lsp_client: C) -> Self {
+        Self::with_dependencies_and_progress(
+            config,
+            process_manager,
+            lsp_client,
+            IndexProgressMonitor::new(),
+        )
+    }
+
+    pub fn with_dependencies_and_progress(
         config: ClangdConfig,
         process_manager: P,
         lsp_client: C,
         index_progress_monitor: IndexProgressMonitor,
-        log_monitor: LogMonitor,
     ) -> Self {
         let started_at = Instant::now();
 
@@ -114,7 +117,6 @@ where
             process_manager: Box::new(process_manager),
             lsp_client: Box::new(lsp_client),
             index_progress_monitor,
-            log_monitor,
             started_at,
         }
     }
@@ -180,30 +182,8 @@ where
         self.started_at.elapsed()
     }
 
-    /// Get reference to the indexing progress monitor
     pub fn index_progress_monitor(&self) -> &IndexProgressMonitor {
         &self.index_progress_monitor
-    }
-
-    /// Get reference to the log monitor
-    pub fn log_monitor(&self) -> &LogMonitor {
-        &self.log_monitor
-    }
-
-    /// Setup stderr processing for the log monitor
-    /// This must be called after session creation to wire stderr to log monitor
-    pub fn setup_stderr_monitoring(&mut self)
-    where
-        P: StderrMonitor,
-    {
-        let processor = self.log_monitor.create_stderr_processor();
-
-        // Install the stderr processor
-        self.process_manager.on_stderr_line(move |line: String| {
-            processor(line);
-        });
-
-        debug!("LogMonitor stderr processing wired to process manager");
     }
 }
 

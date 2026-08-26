@@ -28,10 +28,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+use crate::clangd::progress::IndexStatus;
 use crate::mcp_server::tools::lsp_helpers::document_symbols::SymbolSearchBuilder;
 use crate::mcp_server::tools::lsp_helpers::workspace_symbols::WorkspaceSymbolSearchBuilder;
 use crate::mcp_server::tools::utils;
-use crate::project::index::IndexStatusView;
 use crate::project::{ComponentSession, ProjectComponent};
 use crate::symbol::Symbol;
 
@@ -43,9 +43,8 @@ pub struct SearchResult {
     pub total_matches: usize,
     pub symbols: Vec<Symbol>,
     pub metadata: SearchMetadata,
-    /// Index status information when timeout occurred or no indexing wait
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_status: Option<IndexStatusView>,
+    pub index_status: Option<IndexStatus>,
 }
 
 /// Metadata about the search operation
@@ -132,8 +131,7 @@ pub struct FileProcessingResult {
                    • kinds: Optional symbol type filtering (PascalCase names)
                    • max_results: Result limit (default: 100, max: 1000)
                    • include_external: Include system/library symbols (default: false)
-                   • build_directory: Custom build directory path (STRONGLY PREFER ABSOLUTE PATHS from get_project_details)
-                   • wait_timeout: Indexing completion timeout in seconds (default: 20s)"
+                   • build_directory: Custom build directory path (STRONGLY PREFER ABSOLUTE PATHS from get_project_details)"
 )]
 #[derive(Debug, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub struct SearchSymbolsTool {
@@ -183,7 +181,7 @@ pub struct SearchSymbolsTool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_directory: Option<String>,
 
-    /// Timeout in seconds to wait for indexing completion (default: 20s, 0 = no wait)
+    /// Seconds to wait for clangd's current indexing pass (default: 20, 0 = immediate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_timeout: Option<u64>,
 }
@@ -216,20 +214,14 @@ impl SearchSymbolsTool {
             };
 
         info!(
-            "Searching symbols (v2): query='{}', kinds={:?}, max_results={:?}, wait_timeout={:?}",
+            "Searching symbols: query='{}', kinds={:?}, max_results={:?}, wait_timeout={:?}",
             self.query, symbol_kinds, self.max_results, self.wait_timeout
         );
 
-        // Selective indexing wait logic based on search type
-        let index_status = utils::handle_selective_indexing_wait(
+        let index_status = utils::wait_for_clangd_index(
             &component_session,
-            self.files.is_some(), // Skip indexing for document search (files specified)
+            self.files.is_some(),
             self.wait_timeout,
-            if self.files.is_some() {
-                "Document search"
-            } else {
-                "Workspace search"
-            },
         )
         .await;
 
@@ -249,8 +241,6 @@ impl SearchSymbolsTool {
             self.search_workspace_symbols(&component_session, component, symbol_kinds.as_ref())
                 .await?
         };
-
-        // Include index status if available
         result.index_status = index_status;
 
         let output = serde_json::to_string_pretty(&result).map_err(|e| {
@@ -310,7 +300,7 @@ impl SearchSymbolsTool {
                 build_directory: component.build_dir_path.display().to_string(),
                 files_processed: None,
             },
-            index_status: None, // Will be set by caller
+            index_status: None,
         })
     }
 
@@ -413,7 +403,7 @@ impl SearchSymbolsTool {
                 build_directory: component.build_dir_path.display().to_string(),
                 files_processed: Some(processed_files),
             },
-            index_status: None, // Will be set by caller
+            index_status: None,
         })
     }
 }

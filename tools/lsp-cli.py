@@ -698,7 +698,7 @@ SYMBOL_KIND_CHOICES = sorted(set(_SYMBOL_KINDS.values()))
 _EPILOG = """\
 examples:
   lsp-cli.py project                             list build directories to use below
-  lsp-cli.py index --build-directory build       check whether clangd has finished indexing
+  lsp-cli.py index --build-directory build       show clangd's current index state
   lsp-cli.py search Math                         find symbols whose name matches "Math"
   lsp-cli.py search Buffer --kind Class Struct   restrict the search to types
   lsp-cli.py search "" --files src/main.cpp      list every symbol defined in one file
@@ -786,18 +786,18 @@ def create_parser() -> argparse.ArgumentParser:
         "--depth", type=int, choices=range(0, 11), metavar="0-10",
         help="How many directory levels to search for build directories.",
     )
-    project.add_argument(
-        "--include-details", action="store_true",
-        help="Also list every build option and configuration variable. Verbose.",
-    )
 
     index = commands.add_parser(
         "index",
         aliases=["get-index-status"],
-        help="Show how far clangd has got indexing a build directory",
+        help="Show the current background-index state reported by clangd",
     )
     _add_build_directory(index)
-    _add_wait_timeout(index, "indexing to finish")
+    _add_wait_timeout(index, "clangd's current indexing pass to finish")
+    project.add_argument(
+        "--include-details", action="store_true",
+        help="Also list every build option and configuration variable. Verbose.",
+    )
 
     search = commands.add_parser(
         "search",
@@ -827,7 +827,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Also match symbols from system headers and third-party libraries.",
     )
     _add_build_directory(search)
-    _add_wait_timeout(search, "indexing to finish")
+    _add_wait_timeout(search, "clangd's current indexing pass to finish")
 
     analyze = commands.add_parser(
         "analyze",
@@ -844,7 +844,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Pick a specific overload by where it is declared. Lines and columns are 1-based.",
     )
     _add_build_directory(analyze)
-    _add_wait_timeout(analyze, "indexing to finish")
+    _add_wait_timeout(analyze, "clangd's current indexing pass to finish")
 
     diagnostics = commands.add_parser(
         "diagnostics",

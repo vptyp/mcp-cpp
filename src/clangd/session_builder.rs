@@ -2,15 +2,13 @@
 
 use lsp_types::request::Request;
 use std::marker::PhantomData;
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::clangd::config::ClangdConfig;
 use crate::clangd::error::ClangdSessionError;
-use crate::clangd::index::{IndexProgressMonitor, ProgressEvent};
-use crate::clangd::log_monitor::LogMonitor;
+use crate::clangd::progress::IndexProgressMonitor;
 use crate::clangd::session::ClangdSession;
-use crate::io::{ChildProcessManager, ProcessManager, StderrMonitor, StdioTransport};
+use crate::io::{ChildProcessManager, ProcessManager, StdioTransport};
 use crate::lsp::{LspClient, traits::LspClientTrait};
 
 /// Phantom type markers for builder state
@@ -48,7 +46,6 @@ pub struct ClangdSessionBuilder<ConfigState = NoConfig, P = NoProcessManager, C 
     config: Option<ClangdConfig>,
     process_manager: Option<P>,
     lsp_client: Option<C>,
-    progress_sender: Option<mpsc::Sender<ProgressEvent>>,
     _phantom: PhantomData<(ConfigState, P, C)>,
 }
 
@@ -59,7 +56,6 @@ impl ClangdSessionBuilder<NoConfig, NoProcessManager, NoLspClient> {
             config: None,
             process_manager: None,
             lsp_client: None,
-            progress_sender: None,
             _phantom: PhantomData,
         }
     }
@@ -72,7 +68,6 @@ impl<P, C> ClangdSessionBuilder<NoConfig, P, C> {
             config: Some(config),
             process_manager: self.process_manager,
             lsp_client: self.lsp_client,
-            progress_sender: self.progress_sender,
             _phantom: PhantomData,
         }
     }
@@ -91,7 +86,6 @@ impl<ConfigState, C> ClangdSessionBuilder<ConfigState, NoProcessManager, C> {
             config: self.config,
             process_manager: Some(process_manager),
             lsp_client: self.lsp_client,
-            progress_sender: self.progress_sender,
             _phantom: PhantomData,
         }
     }
@@ -107,17 +101,8 @@ impl<ConfigState, P> ClangdSessionBuilder<ConfigState, P, NoLspClient> {
             config: self.config,
             process_manager: self.process_manager,
             lsp_client: Some(lsp_client),
-            progress_sender: self.progress_sender,
             _phantom: PhantomData,
         }
-    }
-}
-
-impl<ConfigState, P, C> ClangdSessionBuilder<ConfigState, P, C> {
-    /// Inject a progress event sender
-    pub fn with_progress_sender(mut self, sender: mpsc::Sender<ProgressEvent>) -> Self {
-        self.progress_sender = Some(sender);
-        self
     }
 }
 
@@ -132,39 +117,21 @@ impl ClangdSessionBuilder<HasConfig, NoProcessManager, NoLspClient> {
 
         let config = self.config.unwrap();
 
-        let log_monitor = if let Some(ref progress_sender) = self.progress_sender {
-            LogMonitor::with_sender(progress_sender.clone())
-        } else {
-            LogMonitor::new()
-        };
         let mut process_manager = Self::create_process_manager_without_start(&config).await?;
-
-        let stderr_processor = log_monitor.create_stderr_processor();
-        process_manager.on_stderr_line(move |line: String| {
-            stderr_processor(line);
-        });
-
         process_manager.start().await?;
 
         let mut lsp_client =
             Self::create_lsp_client(&config, process_manager.create_stdio_transport()?).await?;
-        let index_progress_monitor =
-            Self::setup_monitoring(&mut lsp_client, self.progress_sender.clone()).await;
+        let index_progress_monitor = Self::setup_request_handler(&mut lsp_client).await;
 
-        Self::finalize_session(
-            config,
-            process_manager,
-            lsp_client,
-            index_progress_monitor,
-            log_monitor,
-        )
+        Self::finalize_session(config, process_manager, lsp_client, index_progress_monitor)
     }
 }
 
 // Testing build (config required, both dependencies injected)
 impl<P, C> ClangdSessionBuilder<HasConfig, P, C>
 where
-    P: ProcessManager + StderrMonitor + 'static,
+    P: ProcessManager + 'static,
     C: LspClientTrait + 'static,
 {
     /// Build the session with injected dependencies
@@ -172,23 +139,11 @@ where
         let config = self.config.unwrap(); // Safe: HasConfig guarantees this
         let process_manager = self.process_manager.unwrap(); // Safe: P != NoProcessManager guarantees this
         let lsp_client = self.lsp_client.unwrap(); // Safe: C != NoLspClient guarantees this
-        let index_progress_monitor = if let Some(ref progress_sender) = self.progress_sender {
-            IndexProgressMonitor::with_sender(progress_sender.clone())
-        } else {
-            IndexProgressMonitor::new()
-        };
-        let log_monitor = if let Some(progress_sender) = self.progress_sender {
-            LogMonitor::with_sender(progress_sender)
-        } else {
-            LogMonitor::new()
-        };
-
-        let session = ClangdSession::with_dependencies(
+        let session = ClangdSession::with_dependencies_and_progress(
             config,
             process_manager,
             lsp_client,
-            index_progress_monitor,
-            log_monitor,
+            IndexProgressMonitor::new(),
         );
 
         Ok(session)
@@ -264,27 +219,17 @@ impl ClangdSessionBuilder<HasConfig, NoProcessManager, NoLspClient> {
         Ok(lsp_client)
     }
 
-    /// Setup monitoring and request handlers
-    async fn setup_monitoring(
+    /// Register the request clangd sends before publishing work progress.
+    async fn setup_request_handler(
         lsp_client: &mut LspClient<StdioTransport>,
-        progress_sender: Option<mpsc::Sender<ProgressEvent>>,
     ) -> IndexProgressMonitor {
-        debug!("Creating and wiring IndexProgressMonitor");
-        let index_progress_monitor = if let Some(sender) = progress_sender {
-            IndexProgressMonitor::with_sender(sender)
-        } else {
-            IndexProgressMonitor::new()
-        };
-        let notification_handler = index_progress_monitor.create_handler();
+        let index_progress_monitor = IndexProgressMonitor::new();
         lsp_client
-            .register_notification_handler(notification_handler)
+            .register_notification_handler(index_progress_monitor.create_handler())
             .await;
-
         lsp_client
             .register_request_handler(Self::create_request_handler())
             .await;
-
-        debug!("IndexProgressMonitor and request handler wired successfully");
         index_progress_monitor
     }
 
@@ -317,18 +262,16 @@ impl ClangdSessionBuilder<HasConfig, NoProcessManager, NoLspClient> {
         process_manager: ChildProcessManager,
         lsp_client: LspClient<StdioTransport>,
         index_progress_monitor: IndexProgressMonitor,
-        log_monitor: LogMonitor,
     ) -> Result<ClangdSession<ChildProcessManager, LspClient<StdioTransport>>, ClangdSessionError>
     {
         info!("Clangd session started successfully");
 
         // Create session with all components
-        let session = ClangdSession::with_dependencies(
+        let session = ClangdSession::with_dependencies_and_progress(
             config,
             process_manager,
             lsp_client,
             index_progress_monitor,
-            log_monitor,
         );
 
         Ok(session)

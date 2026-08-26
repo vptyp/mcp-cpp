@@ -1,0 +1,6 @@
+{
+  "transport": "http",
+  "http_url": "http://127.0.0.1:18080/mcp",
+  "session_id": "79367043-c22d-4286-95c7-a174729769e1",
+  "server_path": null
+}

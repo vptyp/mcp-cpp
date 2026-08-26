@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, instrument, warn};
 
-use crate::mcp_server::tools::utils;
-use crate::project::index::IndexStatusView;
+use crate::clangd::progress::IndexStatus;
 use crate::project::{ComponentSession, ProjectComponent};
 
 /// Default timeout (seconds) to wait for clangd to publish diagnostics.
@@ -34,9 +33,8 @@ pub struct DiagnosticsResult {
     /// Whether we gave up waiting because clangd didn't publish in time
     pub timed_out: bool,
     pub diagnostics: Vec<lsp_types::Diagnostic>,
-    /// Index status when the timeout occurred or no indexing wait was performed
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_status: Option<IndexStatusView>,
+    pub index_status: Option<IndexStatus>,
 }
 
 #[mcp_tool(
@@ -102,15 +100,7 @@ impl ShowDiagnosticsTool {
             self.file, wait_timeout
         );
 
-        // This is a document-specific operation, so skip the indexing wait and
-        // return current index status.
-        let index_status = utils::handle_selective_indexing_wait(
-            &component_session,
-            true,
-            self.wait_timeout,
-            "show_diagnostics",
-        )
-        .await;
+        let index_status = component_session.index_status().await;
 
         // Resolve the file path to an absolute path using the project root
         let project_root = &component.source_root_path;
@@ -185,7 +175,7 @@ impl ShowDiagnosticsTool {
             notes,
             timed_out,
             diagnostics,
-            index_status,
+            index_status: Some(index_status),
         };
 
         let output = serde_json::to_string_pretty(&result).map_err(|e| {

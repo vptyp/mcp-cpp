@@ -4,7 +4,6 @@
 //! DiagnosticsCollector wired into the ComponentSession. They use real clangd
 //! integration with the test project.
 
-use crate::clangd::config::DEFAULT_INDEX_WAIT_TIMEOUT_SECS;
 use crate::project::{ProjectScanner, WorkspaceSession};
 use crate::test_utils::integration::TestProject;
 use std::time::Duration;
@@ -44,10 +43,7 @@ async fn test_show_diagnostics_returns_published_diagnostics() {
     let target_file = test_project.project_root.join("src/main.cpp");
 
     let diagnostics = component_session
-        .get_file_diagnostics(
-            &target_file,
-            Duration::from_secs(DEFAULT_INDEX_WAIT_TIMEOUT_SECS),
-        )
+        .get_file_diagnostics(&target_file, Duration::from_secs(20))
         .await
         .expect("Failed to collect diagnostics");
 

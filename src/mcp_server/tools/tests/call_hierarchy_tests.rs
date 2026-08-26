@@ -311,7 +311,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
     // Assert that indexing completed successfully (either None or Completed state)
     if let Some(ref status) = variance_analysis.index_status {
         assert!(
-            status.state.contains("Completed") && status.indexed_files == status.total_files,
+            status.state.contains("Completed"),
             "Indexing should have completed successfully for variance analysis. Index status: {:?}",
             variance_analysis.index_status
         );
@@ -357,7 +357,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
     // Assert that indexing completed successfully for mean analysis
     if let Some(ref status) = mean_analysis.index_status {
         assert!(
-            status.state.contains("Completed") && status.indexed_files == status.total_files,
+            status.state.contains("Completed"),
             "Indexing should have completed successfully for mean analysis. Index status: {:?}",
             mean_analysis.index_status
         );
@@ -403,7 +403,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
     // Assert that indexing completed successfully for standardDeviation analysis
     if let Some(ref status) = std_dev_analysis.index_status {
         assert!(
-            status.state.contains("Completed") && status.indexed_files == status.total_files,
+            status.state.contains("Completed"),
             "Indexing should have completed successfully for standardDeviation analysis. Index status: {:?}",
             std_dev_analysis.index_status
         );

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::clangd::version::ClangdVersion;
 use crate::config::AppConfig;
 use crate::project::compilation_database::CompilationDatabase;
 use crate::project::component::ProjectComponent;
@@ -35,8 +34,6 @@ pub struct WorkspaceSession {
     session_creation: Arc<Mutex<HashMap<PathBuf, Arc<CreationSlot>>>>,
     /// Resolved application configuration (clangd settings, scan settings, ...)
     config: Arc<AppConfig>,
-    /// Clangd version information
-    clangd_version: ClangdVersion,
     /// Project scanner for dynamic component discovery
     scanner: ProjectScanner,
 }
@@ -78,17 +75,6 @@ impl CreationSlot {
 impl WorkspaceSession {
     /// Create a new WorkspaceSession for the given project workspace
     pub fn new(workspace: ProjectWorkspace, config: Arc<AppConfig>) -> Result<Self, ProjectError> {
-        // Detect clangd version for index format compatibility
-        let clangd_version =
-            ClangdVersion::detect(Path::new(&config.clangd.path)).map_err(|e| {
-                ProjectError::SessionCreation(format!("Failed to detect clangd version: {}", e))
-            })?;
-
-        info!(
-            "Detected clangd version: {}.{}.{}",
-            clangd_version.major, clangd_version.minor, clangd_version.patch
-        );
-
         // Create scanner with default providers for dynamic discovery
         let scanner = ProjectScanner::with_default_providers();
 
@@ -97,7 +83,6 @@ impl WorkspaceSession {
             component_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_creation: Arc::new(Mutex::new(HashMap::new())),
             config,
-            clangd_version,
             scanner,
         })
     }
@@ -255,8 +240,7 @@ impl WorkspaceSession {
         };
 
         let component_session =
-            ComponentSession::new(component, &self.config, &self.clangd_version, project_root)
-                .await?;
+            ComponentSession::new(component, &self.config, project_root).await?;
 
         let component_session_arc = Arc::new(component_session);
 
