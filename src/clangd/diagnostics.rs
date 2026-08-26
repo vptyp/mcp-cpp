@@ -75,6 +75,22 @@ impl DiagnosticsCollector {
         // Always store the published set, even when empty (a clean file still
         // triggers an empty publish to clear prior diagnostics). Storing the empty
         // list lets callers distinguish "file is clean" from "no diagnostics yet".
+        //
+        // Exception: a `didClose` clear. When a file is closed, clangd publishes an
+        // empty set with `version: None` to signal "this file no longer has
+        // diagnostics". A real parse (even of a clean file) always carries the
+        // document `version: Some(N)`. If we stored the close-clear, a diagnostics
+        // caller that closes+reopens to force a reparse would see the empty clear
+        // arrive ~instantly and return "0 diagnostics" before clangd finishes
+        // reparsing and publishes the real set seconds later. Skipping empty +
+        // version-less publishes makes `wait_for_uri` wait for the real result.
+        if params.diagnostics.is_empty() && params.version.is_none() {
+            trace!(
+                "DiagnosticsCollector: skipping close-clear publish for {}",
+                uri
+            );
+            return;
+        }
         state.diagnostics.insert(uri, params.diagnostics);
     }
 

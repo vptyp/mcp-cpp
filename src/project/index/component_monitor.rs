@@ -459,6 +459,7 @@ impl ComponentIndexMonitor {
     ///
     /// Reported alongside the status so a caller can tell "nothing is indexed"
     /// apart from "we have not finished looking yet".
+    #[allow(dead_code)] // server-side disk scan removed; retained for tests
     pub async fn initial_scan_state(&self) -> InitialScanState {
         self.state.lock().await.initial_scan_state
     }

@@ -25,7 +25,6 @@ use crate::project::index::storage::IndexStorage;
 use crate::project::index::storage::filesystem::FilesystemIndexStorage;
 use crate::project::index::{
     ClangdIndexTrigger, ComponentIndexMonitor, ComponentIndexingState, IndexStatusView,
-    InitialScanState,
 };
 use crate::project::{CompilationDatabase, ProjectComponent, ProjectError};
 use lsp_types::Diagnostic;
@@ -107,8 +106,11 @@ impl ComponentSession {
             .pch_storage(clangd.pch_storage)
             .workspace_symbol_limit(clangd.workspace_symbol_limit)
             .initialization_timeout(clangd.initialization_timeout)
-            .request_timeout(clangd.request_timeout)
-            .add_arg("--log=verbose");
+            .request_timeout(clangd.request_timeout);
+        // Note: --log=verbose is intentionally NOT added. It generates a huge
+        // stderr volume that adds parsing overhead and aligns the server's clangd
+        // flags with VS Code's (which omits it). clangd's $/progress arrives via
+        // the LSP client regardless of log verbosity.
 
         if let Some(threads) = clangd.index_threads {
             builder = builder.index_threads(threads);
@@ -237,22 +239,15 @@ impl ComponentSession {
 
         let monitor_arc = Arc::new(monitor);
 
-        // Reconcile with the shards already on disk, in the background.
-        //
-        // This must not run inline: on a large tree it parses every existing .idx
-        // file, which would duplicate clangd's work and stall session creation for
-        // minutes. But it must run *somewhere*, because clangd only reports work it
-        // actually performs -- on an already-indexed tree it emits no $/progress at
-        // all, leaving the monitor stuck at Init/0 with no evidence to correct it.
-        // Off the request path, it costs nothing that clangd was not already doing
-        // and short-circuits immediately when no index files exist.
-        let scan_monitor = Arc::clone(&monitor_arc);
-        tokio::spawn(async move {
-            scan_monitor.perform_initial_scan().await;
-        });
-
         // Kick off indexing (opens one file) and let clangd drive the completion
         // latch. Searches wait on that latch, bounded by the tool's wait_timeout.
+        //
+        // We deliberately do NOT run our own on-disk .idx reconcile scan. On a
+        // large tree it parses every shard (148k files on Chromium), burning 3+
+        // cores and several GB of RAM while duplicating clangd's own work and
+        // starving the very clangd process it is meant to monitor. clangd's
+        // $/progress (surfaced directly) is the single source of truth for index
+        // status; an already-indexed tree simply reports Completed.
         if let Err(e) = monitor_arc
             .trigger_initial_indexing(compilation_database.clone())
             .await
@@ -294,6 +289,24 @@ impl ComponentSession {
         self.clangd_session.lock().await
     }
 
+    /// Close a file in the LSP server.
+    ///
+    /// Used by the diagnostics flow to force a fresh `didOpen`: clangd only
+    /// publishes `publishDiagnostics` when it (re)parses a file, and a `didOpen`
+    /// for an already-open file is illegal in LSP. Closing first guarantees the
+    /// subsequent `ensure_file_ready` sends a real `didOpen` and clangd reparses,
+    /// so diagnostics are not lost when an earlier open happened while clangd was
+    /// busy (e.g. mid index-load) and never published.
+    pub async fn close_file(&self, path: &std::path::Path) -> Result<(), ProjectError> {
+        let mut session = self.clangd_session.lock().await;
+        let mut file_manager = self.file_manager.lock().await;
+
+        file_manager
+            .close_file(path, session.client_mut())
+            .await
+            .map_err(|e| ProjectError::SessionCreation(format!("File close failed: {}", e)))
+    }
+
     /// Collect fresh clangd diagnostics for a file.
     ///
     /// Diagnostics are pushed asynchronously by clangd only after a file is opened
@@ -313,6 +326,13 @@ impl ComponentSession {
 
         // Reset so the next publish for this file is treated as fresh.
         self.diagnostics_collector.reset_for_uri(&uri).await;
+
+        // Force a fresh `didOpen`: clangd only republishes diagnostics when it
+        // (re)parses, and `ensure_file_ready` is a no-op for an already-open
+        // unchanged file. If a prior open was lost (e.g. clangd was mid index-load
+        // and never published), the file would otherwise stay "open" with no
+        // diagnostics forever. Closing first makes the reopen a real didOpen.
+        self.close_file(path).await.ok();
 
         // Open (or refresh) the file, which triggers clangd to publish diagnostics.
         self.ensure_file_ready(path).await?;
@@ -380,8 +400,10 @@ impl ComponentSession {
     /// including ETA calculation if applicable.
     pub async fn get_index_status(&self) -> IndexStatusView {
         let (component_state, start_time) = self.index_monitor.get_progress_data().await;
-        let scan_in_progress =
-            self.index_monitor.initial_scan_state().await != InitialScanState::Complete;
+        // No server-side disk scan is performed: clangd's $/progress is the sole
+        // source of truth for index status, so there is never a background scan in
+        // flight to report as provisional.
+        let scan_in_progress = false;
 
         // Determine if indexing is in progress
         let in_progress = matches!(component_state.state, ComponentIndexingState::InProgress(_));
