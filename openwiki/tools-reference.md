@@ -90,7 +90,7 @@ Source: `src/mcp_server/tools/search_symbols.rs` - `SearchSymbolsTool`.
 - **Workspace search** (when `files` is `None`): uses LSP `workspace/symbol`. Subject to clangd's internal heuristics and relevance ranking; may not return every match. Sends a fixed 2000-symbol query to clangd and applies `max_results` client-side for consistent ranking.
 - **Document search** (when `files` is provided): uses `textDocument/documentSymbol` per file. Returns all symbols in each file matching the query (substring match); more predictable and complete.
 
-**Output**: A `SearchResult` JSON object with `success`, `query`, `total_matches`, `symbols` (each a `Symbol`: `name`, `kind`, `container_name`, `location`), `metadata` (`search_type`, `build_directory`, per-file `files_processed`), and optional `index_status` (attached when the indexing wait timed out or was skipped).
+**Output**: A `SearchResult` JSON object with `success`, `query`, `total_matches`, `symbols` (each a `Symbol`: `name`, `kind`, `container_name`, `location`), `metadata` (`search_type`, `build_directory`, per-file `files_processed`), and optional `index_status` (an `IndexStatus` from `src/clangd/progress.rs`, attached when clangd's indexing is not yet complete after the wait or the wait was skipped).
 
 ---
 
@@ -140,13 +140,13 @@ Source: `src/mcp_server/tools/show_diagnostics.rs` - `ShowDiagnosticsTool`.
 
 Source: `src/mcp_server/tools/index_status.rs` - `GetIndexStatusTool`.
 
-**Purpose**: Lightweight indexing progress report for a build directory, without running an expensive search. Useful for monitoring a long background index build (e.g. a large Chromium tree).
+**Purpose**: Lightweight indexing progress report for a build directory, directly from clangd's own background-index progress notifications - no cache files or clangd logs are read. Useful for monitoring a long background index build (e.g. a large Chromium tree).
 
 **Parameters**:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `build_directory` | `Option<String>` | auto-detect | Absolute path preferred. |
-| `wait_timeout` | `Option<u64>` | `0` | Seconds to wait for indexing to complete before returning; `0` = return immediately. |
+| `wait_timeout` | `Option<u64>` | `0` | Seconds to wait for clangd's current indexing pass to finish before returning; `0` = return immediately. |
 
-**Output**: An `IndexStatusResult` JSON object with `success`, `build_directory`, and `index_status` (an `IndexStatusView`: `in_progress`, `progress_percentage`, `indexed_files`, `total_files`, `start_time`, `estimated_time_remaining`, `state`).
+**Output**: An `IndexStatusResult` JSON object with `success`, `build_directory`, and `index_status` (an `IndexStatus` from `src/clangd/progress.rs`: `state` - one of `NotStarted`/`InProgress`/`Completed`; `in_progress` bool; optional `percentage` (0-100); optional `message`). The status mirrors clangd's `$/progress` notifications on the `backgroundIndexProgress` token; `state` becomes `Completed` with `percentage: 100` on the `end` progress kind.

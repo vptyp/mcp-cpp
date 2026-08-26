@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Clangd Session and Indexing
-description: The clangd session lifecycle, LSP client/protocol/framing layers, and the dual-source indexing subsystem that tracks clangd progress via LSP notifications and stderr log parsing.
+description: The clangd session lifecycle, LSP client/protocol/framing layers, and the direct clangd $/progress index-status monitor that reports background indexing progress without parsing on-disk shard files.
 resource: https://github.com/mpsm/mcp-cpp
 tags: [clangd, lsp, indexing, session, rust]
 openwiki:
@@ -10,17 +10,10 @@ openwiki:
     - src/clangd/config.rs
     - src/clangd/session.rs
     - src/clangd/session_builder.rs
-    - src/clangd/version.rs
-    - src/clangd/log_monitor.rs
+    - src/clangd/progress.rs
     - src/clangd/file_manager.rs
     - src/clangd/diagnostics.rs
     - src/clangd/error.rs
-    - src/clangd/index/component_index.rs
-    - src/clangd/index/idx_parser.rs
-    - src/clangd/index/hash.rs
-    - src/clangd/index/progress_monitor.rs
-    - src/clangd/index/latch.rs
-    - src/clangd/index/progress_events.rs
     - src/lsp/client.rs
     - src/lsp/protocol.rs
     - src/lsp/framing.rs
@@ -33,15 +26,10 @@ openwiki:
     - ClangdSession
     - ClangdSessionTrait
     - ClangdSessionBuilder
-    - ClangdVersion
-    - LogMonitor
+    - IndexProgressMonitor
+    - IndexStatus
     - ClangdFileManager
     - DiagnosticsCollector
-    - ComponentIndex
-    - IdxParser
-    - IndexProgressMonitor
-    - IndexLatch
-    - ProgressEvent
     - LspClient
     - LspClientTrait
     - JsonRpcClient
@@ -49,20 +37,20 @@ openwiki:
     - StdioTransport
     - ChildProcessManager
   invariants:
-    - ClangdConfig requires compile_commands.json in the build directory
+    - ClangdConfig requires compile_commands.json reachable from the build directory
     - --compile-commands-dir prefers the working directory if a compile_commands.json exists there
     - Thread count is emitted as -j N not --threads for cross-version compatibility
-    - The clangd stderr processor is installed before process start so the first line is captured
-    - stderr is always drained to prevent clangd blocking on a full pipe
-    - IndexProgressMonitor tracks only the backgroundIndexProgress token
-    - IndexLatch trigger_success/trigger_failure are idempotent and support multiple waiters
-    - The .idx filename hash is xxHash64 for format <=18 and xxh3 for format >=19 and must match clangd
+    - --log=verbose is intentionally NOT added; $/progress arrives via the LSP client regardless of log verbosity
+    - stderr is always drained to prevent clangd blocking on a full pipe, but is not parsed for progress
+    - IndexProgressMonitor tracks only the backgroundIndexProgress token and reads no on-disk shard files
+    - IndexStatus.state is one of NotStarted, InProgress, Completed (set on the "end" progress value with percentage forced to 100)
+    - wait_for_completion returns when in_progress becomes false, not only on an explicit "end" value
     - Drop of an unclosed ClangdSession synchronously SIGKILLs the process
 ---
 
 # Clangd Session and Indexing
 
-`src/clangd` and `src/lsp` together spawn and speak to a clangd language server, track its indexing progress, and parse its on-disk index files. The layers, bottom to top, are IO (`src/io`) -> LSP (framing -> JSON-RPC -> typed client) -> clangd session (config -> builder -> session + monitors).
+`src/clangd` and `src/lsp` together spawn and speak to a clangd language server and report its background-indexing progress directly from clangd's standard LSP `$/progress` notifications. The server no longer maintains a client-side index model, parses on-disk `.idx` shard files, or parses clangd stderr for progress. The layers, bottom to top, are IO (`src/io`) -> LSP (framing -> JSON-RPC -> typed client) -> clangd session (config -> builder -> session + progress monitor).
 
 ## Configuration
 
@@ -70,49 +58,50 @@ openwiki:
 
 - `working_directory` - clangd process CWD (set to the project root by `ComponentSession`).
 - `clangd_path` - defaults to `"clangd"`.
-- `build_directory` - must contain `compile_commands.json` (validated by the builder).
-- `extra_args` - additional clangd args.
-- `lsp_config: LspConfig` - `root_uri`, `initialization_timeout` (default 30s, max 5min), `request_timeout` (default 10s), `verbose_tracing`, client name/version.
-- `resource_config: ResourceConfig` - `stderr_log_path`, `max_memory_mb`, `process_priority`, `background_indexing` (default true), `pch_storage` (Memory/Disk, default Memory), `index_threads`, `max_concurrent_processes`.
+- `build_directory` - a directory from which a `compile_commands.json` is reachable (validated by the builder).
+- `extra_args` - additional clangd args appended after the generated argv.
+- `lsp_config: LspConfig` - `root_uri`, `initialization_timeout` (default 30s, max 5min), `request_timeout` (default 30s), `verbose_tracing`, client name/version.
+- `resource_config: ResourceConfig` - `stderr_log_path`, `workspace_symbol_limit` (emitted as `--limit-results`), `process_priority`, `background_indexing` (default true), `pch_storage` (Memory/Disk, default Memory), `index_threads`, `max_concurrent_processes`.
 
-`ClangdConfigBuilder::build()` validates paths exist, timeouts are positive and within bounds, and args contain no NUL bytes. `get_clangd_args()` builds the argv with two notable invariants:
+`ClangdConfigBuilder::build()` validates paths exist, timeouts are positive and within bounds, and args contain no NUL bytes. `get_clangd_args()` builds the argv with these notable invariants:
 - `--compile-commands-dir` prefers the working directory if a `compile_commands.json` is reachable there, so clangd reuses `.cache/clangd/index` instead of reindexing.
-- Thread count is emitted as `-j N` (not `--threads`) because some bundled clangd builds reject `--threads`.
+- Thread count is emitted as `-j N` (not `--threads`) because some bundled clangd builds (e.g. VS Code 22.1.0) reject `--threads`.
+- `--limit-results` is emitted exactly once here; callers must never append their own `--limit-results` because clangd takes the last occurrence.
+- `--log=verbose` is **not** added. It produces a huge stderr volume that adds parsing overhead, and clangd's `$/progress` notifications arrive through the LSP client regardless of log verbosity. The generated flags align with the set VS Code uses for clangd.
 
-`ClangdVersion::detect(path)` parses `clangd --version` output. `index_format_version()` maps the major version to the clangd index format version (10->12, 11->13, 12/13->16, 14/15->17, 16/17->18, 18/19->19, 20->20). This version selects the hash function used to name `.idx` files.
+> `ClangdConfig` is the per-session shape derived from the resolved `AppConfig`. The layered `src/config` subsystem (CLI args > environment variables > `.mcp-cpp.yaml` > compiled defaults) is described in [Architecture](overview.md) and the [Project and Workspace](project-workspace.md) subsystem page; it is the portability layer that lets the same checkout behave identically across machines without per-machine source edits.
 
 ## Session lifecycle
 
-`ClangdSession<P, C>` (`src/clangd/session.rs`) is generic over `ProcessManager` and `LspClientTrait`. The production type is `ClangdSession<ChildProcessManager, LspClient<StdioTransport>>`. `ClangdSessionTrait` abstracts it for tools and tests.
+`ClangdSession<P, C>` (`src/clangd/session.rs`) is generic over `ProcessManager` and `LspClientTrait`. The production type is `ClangdSession<ChildProcessManager, LspClient<StdioTransport>>`. `ClangdSessionTrait` abstracts it for tools and tests. The session owns an `IndexProgressMonitor` (cloneable, `watch`-channel backed) and exposes it through `index_progress_monitor()`.
 
 ```mermaid
 sequenceDiagram
     participant Builder as ClangdSessionBuilder
     participant PM as ChildProcessManager
-    participant LM as LogMonitor
+    participant Monitor as IndexProgressMonitor
     participant Client as LspClient
     participant Clangd as clangd
-    Builder->>LM: create LogMonitor (with progress sender)
+    Builder->>Monitor: create IndexProgressMonitor
     Builder->>PM: create_process_manager_without_start
-    Builder->>LM: install stderr processor via on_stderr_line
     Builder->>PM: start (spawn clangd)
-    PM-->>Clangd: piped stdio, stderr drain task running
+    PM-->>Clangd: piped stdio, stderr drain task running (not parsed)
     Builder->>Client: new(StdioTransport) then initialize(root_uri)
     Client->>Clangd: initialize + initialized
     Clangd-->>Client: ServerCapabilities
-    Builder->>Client: register IndexProgressMonitor + request handler
+    Builder->>Client: register IndexProgressMonitor handler + request handler
     Builder->>Builder: finalize_session (with_dependencies)
+    Clangd-->>Client: $/progress (backgroundIndexProgress) over the session lifetime
+    Client->>Monitor: update IndexStatus
 ```
 
 `ClangdSessionBuilder` (`src/clangd/session_builder.rs`) uses **phantom-type state markers** (`HasConfig`/`NoConfig`, `HasProcessManager`/`NoProcessManager`, `HasLspClient`/`NoLspClient`) so `build()` is only callable with a config, and the production (real spawn) versus testing (no spawn) impl is selected by which dependencies are injected. The production build:
 
-1. Creates a `LogMonitor` (optionally `with_sender` for `ProgressEvent`).
-2. Builds a `ChildProcessManager` without starting it.
-3. Installs the `LogMonitor` stderr processor via `on_stderr_line` **before** `start()`, so the first stderr line is captured.
-4. Starts the process (spawns clangd with piped stdio; stderr is always drained to prevent blocking).
-5. Creates the `LspClient`, calls `initialize(root_uri)` wrapped in a timeout.
-6. Registers the `IndexProgressMonitor` notification handler and a request handler that accepts `window/workDoneProgressCreate`.
-7. Assembles the session via `with_dependencies`.
+1. Builds a `ChildProcessManager` without starting it.
+2. Starts the process (spawns clangd with piped stdio; stderr is always drained to prevent pipe-full blocking, but the drain is no longer wired to any progress parser).
+3. Creates the `LspClient`, calls `initialize(root_uri)` wrapped in a timeout.
+4. Creates an `IndexProgressMonitor` and registers its notification handler (plus a request handler that accepts `window/workDoneProgressCreate`).
+5. Assembles the session via `with_dependencies`.
 
 **Shutdown**: `close(self)` sends `shutdown` (with timeout), `exit`, closes the client, then `process_manager.stop(Graceful)`. **Drop fallback**: if still running when dropped without `close()`, logs a warning and calls `kill_sync()` (synchronous SIGKILL) - the safety net, not the primary path.
 
@@ -135,72 +124,55 @@ sequenceDiagram
 
 `DiagnosticsCollector` (`src/clangd/diagnostics.rs`) is `Clone`-able shared state that captures `textDocument/publishDiagnostics` notifications. Its handler spawns a background task per notification (never blocking the transport), stores diagnostics keyed by URI string, and deliberately stores empty lists (clean file vs. not-yet-parsed). `wait_for_uri(uri, timeout)` polls every 50ms. `reset_for_uri` clears the cache so the next publish is fresh.
 
-## Indexing subsystem
+## Index status (direct clangd progress)
 
-Indexing is tracked from **two sources** that both emit `ProgressEvent` (`src/clangd/index/progress_events.rs`): LSP progress notifications and stderr log parsing.
+Index status is tracked from a **single source**: clangd's standard LSP `$/progress` notifications on the `backgroundIndexProgress` token. The server performs no client-side index bookkeeping, reads no on-disk `.idx` shard files, and parses no clangd stderr. This was an intentional simplification: the previous client-side index model duplicated clangd's own indexing work, consumed substantial CPU and memory on large trees, and delayed clangd itself.
 
 ```mermaid
 flowchart TD
     Clangd["clangd process"]
-    Stderr["stderr stream"]
-    LSP["LSP notifications"]
-    LM["LogMonitor + ClangdLogParser"]
-    IPM["IndexProgressMonitor"]
-    Chan["mpsc channel ProgressEvent"]
-    BG["ComponentSession background task"]
-    Mon["ComponentIndexMonitor"]
-    CIdx["ComponentIndex (per-file state)"]
-    Latch["IndexLatch (watch channel)"]
-    Disk[".idx files on disk"]
-    Reader["IndexReader + FilesystemIndexStorage"]
+    LSP["LSP $/progress (backgroundIndexProgress)"]
+    IPM["IndexProgressMonitor\n(src/clangd/progress.rs)"]
+    Status["IndexStatus (watch channel)"]
+    Tools["search_symbols / analyze_symbol_context / get_index_status"]
 
-    Clangd --> Stderr
-    Clangd --> LSP
-    Stderr --> LM
+    Clangd -->|begin/report/end| LSP
     LSP --> IPM
-    LM -->|try_send| Chan
-    IPM -->|try_send| Chan
-    Chan --> BG
-    BG --> Mon
-    Mon --> CIdx
-    Mon --> Latch
-    Mon --> Reader
-    Reader --> Disk
+    IPM -->|update| Status
+    Tools -->|status() / wait_for_completion()| Status
 ```
 
-### IndexProgressMonitor (LSP source)
+### IndexProgressMonitor
 
-`IndexProgressMonitor` (`src/clangd/index/progress_monitor.rs`) listens for LSP `$/progress` and `window/workDoneProgressCreate` notifications, tracking **only** the token `"backgroundIndexProgress"`. It parses `"current/total"` report messages and emits `OverallIndexingStarted`, `OverallProgress`, `OverallCompleted` events. Handlers spawn a background task per notification. State: `IndexingStatus` (`NotStarted`/`InProgress{current,total,percentage,message}`/`Completed`/`Failed`).
+`IndexProgressMonitor` (`src/clangd/progress.rs`) is a `Clone`-able monitor backed by a `tokio::sync::watch` channel. It holds the latest `IndexStatus` behind an `Arc<Mutex<IndexStatus>>` and a `watch::Sender<IndexStatus>` so multiple waiters can subscribe.
 
-### LogMonitor (stderr source)
+`create_handler()` returns a notification handler that spawns a background `tokio::task` per notification (never blocking the transport loop). The handler:
+1. Filters for `$/progress` notifications whose `token` is the string `"backgroundIndexProgress"`.
+2. Reads the `value.kind`:
+   - `"begin"` or `"report"` -> `IndexStatus { state: "InProgress", in_progress: true, percentage, message }`.
+   - `"end"` -> `IndexStatus { state: "Completed", in_progress: false, percentage: Some(100), message }`.
+3. Updates the stored status and sends it through the `watch` channel.
 
-`LogMonitor` (`src/clangd/log_monitor.rs`) parses clangd's verbose stderr output. `ClangdLogParser` compiles eight regexes matching lines like `Indexing <path>`, `Indexed <path> (N symbols, M refs, K files)`, AST-failure patterns, and standard-library indexing lines, mapping them to `ProgressEvent` variants. Events are sent with `try_send` (best-effort, no back-pressure).
+### IndexStatus
 
-### ComponentIndex (pure data)
+`IndexStatus` (`src/clangd/progress.rs`) is the user-facing status shape serialized directly into tool output:
 
-`ComponentIndex` (`src/clangd/index/component_index.rs`) is a pure in-memory mapping from source files to expected `.idx` file paths plus per-file state. Constructed from a `CompilationDatabase` and `ClangdVersion`:
-- index directory is `<cdb_dir>/.cache/clangd/index`,
-- for each source file, the index filename is `{basename}.{hash:016X}.idx` where the hash is computed by `compute_file_hash(path, format_version)` (`src/clangd/index/hash.rs`): **xxHash64 for format version <=18** (clangd 12-18) and **xxh3_64bits for format >=19** (clangd 19-20). This must match clangd's own file-naming hash.
-- per-file state machine: `FileIndexState` (`Pending`/`InProgress`/`Indexed`/`Failed(String)`).
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `String` | `"NotStarted"` (default), `"InProgress"`, or `"Completed"`. |
+| `in_progress` | `bool` | `true` only while clangd reports an active indexing pass. |
+| `percentage` | `Option<u8>` | From clangd's `value.percentage`, if present. Forced to `Some(100)` on `"end"`. |
+| `message` | `Option<String>` | From clangd's `value.message`, if present. |
 
-`ComponentIndex` contains no I/O - it is purely data management. Reconciliation with disk is the job of `ComponentIndexMonitor` in `src/project/index/`.
+### Waiting semantics
 
-### IdxParser (binary index files)
+- `status()` returns the latest `IndexStatus` snapshot immediately.
+- `wait_for_completion(timeout)` first checks the current state (handles the trigger-before-wait race). If `state == "Completed"` it returns immediately. Otherwise it awaits `watch` changes until `in_progress` becomes `false`, or until the timeout elapses. Because the condition is `!in_progress` (not only an explicit `"end"` value), a missing or malformed terminal notification does not hang a waiter indefinitely.
 
-`IdxParser` (`src/clangd/index/idx_parser.rs`) parses clangd's binary `.idx` files (RIFF/CdIx container), supporting format versions 12-20. A `.idx` file contains `meta` (4-byte LE format version), `stri` (optionally zlib-compressed string table), and optional `srcs` (include graph nodes). Types: `IncludeGraphNode` (flags, URI, 8-byte digest, direct includes), `IdxFileData` (format_version, include_graph, string_table). Helpers include LEB128 varint decoding. See [docs/clangd_index_spec.md](../docs/clangd_index_spec.md) in the repo for the full format specification.
+### How tools use it
 
-### IndexLatch (completion coordination)
+`ComponentSession` (`src/project/component_session.rs`) exposes `index_status()` (snapshot) and `wait_for_index_status(timeout)` (wait), delegating to the session's `IndexProgressMonitor`. The shared helper `wait_for_clangd_index` (`src/mcp_server/tools/utils.rs`) centralizes the policy:
+- `skip_wait` or a zero timeout -> return an immediate snapshot.
+- otherwise wait up to `wait_timeout` (default 20s, from `AppConfig.clangd.index_wait_timeout`); if the resulting status is still not `Completed`, the status is attached to the tool output (e.g. `search_symbols.index_status`) so the caller knows results may be partial.
 
-`IndexLatch` (`src/clangd/index/latch.rs`) is a `tokio::sync::watch`-based completion latch, `Clone`-able for multiple waiters. State: `Pending`/`Completed`/`Failed(String)`. `wait(timeout)` checks current state first (handles trigger-before-wait race) then awaits a change. `trigger_success`/`trigger_failure` are **idempotent** (only act when `Pending`). Errors: `LatchError::{Timeout, Cancelled, IndexingFailed}`.
-
-### ComponentIndexMonitor (project layer)
-
-`ComponentIndexMonitor` (`src/project/index/component_monitor.rs`) consolidates index state for one build directory. It owns a `ComponentIndex`, an `IndexLatch`, an `IndexReader` (backed by `FilesystemIndexStorage`), and an `IndexTrigger`. It consumes `ProgressEvent`s from the background channel, reconciles per-file state against disk `.idx` files, and triggers indexing of uncovered files by opening them through `ClangdIndexTrigger` (which calls `ClangdFileManager::ensure_file_ready`). `ComponentIndexingState`: `Init`/`InProgress(f32)`/`Partial`/`Completed`. `IndexStatusView` (`src/project/index/status.rs`) is the user-facing progress report (in_progress, percentage, indexed/total files, ETA).
-
-## IO layer
-
-`ChildProcessManager` (`src/io/process.rs`) spawns clangd with piped stdio, takes all three streams immediately on `start()`, and always runs a stderr drain task (even with no handler) to prevent pipe-full blocking. `stop(Graceful)` sends SIGTERM then SIGKILL on Unix (Windows warns). `kill_sync()` is the synchronous Drop safety net.
-
-`StdioTransport` (`src/io/transport.rs`) is channel-based: a stdin writer task and a stdout reader task that accumulates raw bytes and emits only complete valid UTF-8 prefixes, retaining partial multibyte sequences across reads and compacting the buffer to prevent unbounded growth. `MockTransport` records sent messages and returns preloaded responses.
-
-`FileBuffer<F>` (`src/io/file_buffer.rs`) is a UTF-8-normalized, line-indexed file view with auto-refresh on modification; columns are UTF-8 code points. `FileBufferManager` caches buffers by path with a manager-owned `FileSystemTrait` (real or `TestSystem`) for DI.
+`get_index_status` (`src/mcp_server/tools/index_status.rs`) returns this `IndexStatus` directly as its `index_status` field. `show_diagnostics` is a document-specific operation that skips the workspace indexing wait and reports current index status instead.

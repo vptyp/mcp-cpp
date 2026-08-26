@@ -7,7 +7,7 @@ tags: [source-map, repository, rust]
 openwiki:
   roles: [repository]
   invariants:
-    - src/ is organized as five layers - mcp_server, project, clangd, lsp, io - plus symbol and logging utilities
+    - src/ is organized as six layers - config, mcp_server, project, clangd, lsp, io - plus symbol and logging utilities
 ---
 
 # Source Map
@@ -41,41 +41,34 @@ Entrypoint. Parses clap CLI args (`--root`, `--clangd-path`, `--log-level`, `--l
 | `workspace.rs` | `ProjectWorkspace`, `ProjectWorkspaceView`, `ProjectComponentView` (short/full views) |
 | `workspace_session.rs` | `WorkspaceSession` + `CreationSlot` (session cache + in-flight dedup) |
 | `component.rs` | `ProjectComponent` (validated build config) |
-| `component_session.rs` | `ComponentSession` (owns clangd, file manager, diagnostics, index monitor) |
+| `component_session.rs` | `ComponentSession` (owns clangd, file manager, diagnostics, progress monitor) |
 | `scanner.rs` | `ProjectScanner` + `ScanOptions` |
 | `provider.rs` | `ProjectComponentProvider` trait + `ProjectProviderRegistry` |
 | `cmake_provider.rs` | `CmakeProvider` (parses `CMakeCache.txt`) |
 | `meson_provider.rs` | `MesonProvider` (parses `meson-info/intro-*.json`) |
 | `compilation_database.rs` | `CompilationDatabase` + `BuildOptions` aggregation |
 | `error.rs` | `ProjectError` |
-| `index/component_monitor.rs` | `ComponentIndexMonitor` + `ComponentIndexingState` |
-| `index/reader.rs` | `IndexReader`/`IndexReaderTrait` |
-| `index/state.rs` | `IndexState` for CDB entries |
-| `index/status.rs` | `IndexStatusView` |
-| `index/trigger.rs` | `IndexTrigger` trait + `ClangdIndexTrigger` |
-| `index/storage/` | `IndexStorage` trait + `FilesystemIndexStorage` |
-| `index/integration_tests.rs` | Feature-gated project index tests |
+
+## `src/config/`
+
+| File | Role |
+|---|---|
+| `mod.rs` | `AppConfig`, `ClangdSettings`, `ProjectSettings`, `ServerSettings`, `CliOverrides`; `AppConfig::resolve` merges CLI > env > `.mcp-cpp.yaml` > defaults |
+| `file.rs` | `ConfigFile` (`.mcp-cpp.yaml` deserialization) + `ConfigError` |
 
 ## `src/clangd/`
 
 | File | Role |
 |---|---|
-| `mod.rs` | Re-exports session + index types |
+| `mod.rs` | Re-exports session + progress types |
 | `config.rs` | `ClangdConfig`, `ClangdConfigBuilder`, `LspConfig`, `ResourceConfig`, `PchStorage`, `ProcessPriority` |
 | `session.rs` | `ClangdSession<P,C>`, `ClangdSessionTrait`, `close()` + Drop safety net |
 | `session_builder.rs` | `ClangdSessionBuilder` (phantom-typed, production vs test build) |
-| `version.rs` | `ClangdVersion::detect` + `index_format_version()` mapping |
-| `log_monitor.rs` | `LogMonitor` + `ClangdLogParser` (stderr -> ProgressEvent) |
+| `progress.rs` | `IndexProgressMonitor` + `IndexStatus` (LSP `$/progress` for `backgroundIndexProgress`) |
 | `file_manager.rs` | `ClangdFileManager` (LSP document sync, SHA-256 change detection) |
 | `diagnostics.rs` | `DiagnosticsCollector` (captures publishDiagnostics) |
 | `error.rs` | `ClangdSessionError`, `ClangdConfigError` |
 | `testing.rs` | `MockClangdSession`, test config/session helpers |
-| `index/component_index.rs` | `ComponentIndex` (pure data: source -> .idx mapping + state) |
-| `index/idx_parser.rs` | `IdxParser` (RIFF/CdIx binary parser, formats 12-20) |
-| `index/hash.rs` | `compute_file_hash` (xxHash64 <=18, xxh3 >=19) |
-| `index/progress_monitor.rs` | `IndexProgressMonitor` (LSP `$/progress` for `backgroundIndexProgress`) |
-| `index/latch.rs` | `IndexLatch` (watch-channel completion latch) |
-| `index/progress_events.rs` | `ProgressEvent` enum |
 
 ## `src/lsp/`
 
@@ -116,11 +109,11 @@ Entrypoint. Parses clap CLI args (`--root`, `--clangd-path`, `--log-level`, `--l
 
 | Directory | Contents |
 |---|---|
-| `tools/` | Python: `lsp-cli.py`, `generate-index.py`, `clangd-idx-viewer.py`, `read-cmake-cache.py`, `requirements.txt` |
+| `tools/` | Python: `lsp-cli.py`, `read-cmake-cache.py`, `requirements.txt` |
 | `test/test-project/` | C++20 CMake fixture (10 headers, 7 sources) |
 | `test/test-meson-project/` | C++17 Meson fixture |
 | `test/requests/` | 11 raw JSON-RPC replay payloads |
 | `test/e2e/` | TypeScript/Vitest E2E framework and suites |
-| `docs/` | `clangd_index_spec.md`, `symbol_context_analyzer_implementation.md`, `symbol_search_explorer_implementation.md` |
+| `docs/` | `symbol_context_analyzer_implementation.md`, `symbol_search_explorer_implementation.md` |
 | `docker/` | `entrypoint.sh` |
 | `.github/workflows/` | `ci.yml`, `release.yml`, `openwiki-update.yml` |

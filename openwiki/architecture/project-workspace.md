@@ -83,7 +83,6 @@ erDiagram
     ComponentSession ||--|| ClangdSession : owns
     ComponentSession ||--|| ClangdFileManager : owns
     ComponentSession ||--|| DiagnosticsCollector : owns
-    ComponentSession ||--|| ComponentIndexMonitor : owns
     ProjectWorkspace ||--o{ ProjectComponentView : "get_short_view / get_full_view"
     ProjectWorkspaceView ||--o{ ProjectComponentView : contains
 
@@ -116,8 +115,8 @@ erDiagram
 ### WorkspaceSession
 
 `WorkspaceSession` (`src/project/workspace_session.rs`) is the long-lived owner created in `main.rs`. It:
-- detects the clangd version once at construction (`ClangdVersion::detect`) to select the correct index format hash,
 - holds `Arc<Mutex<ProjectWorkspace>>` so dynamic discovery can add components,
+- holds a shared `Arc<AppConfig>` (resolved from CLI > env > `.mcp-cpp.yaml` > defaults),
 - maintains `component_sessions: Arc<Mutex<HashMap<PathBuf, Arc<ComponentSession>>>>`,
 - deduplicates in-flight creation with `session_creation: Arc<Mutex<HashMap<PathBuf, Arc<CreationSlot>>>>`.
 
@@ -140,7 +139,7 @@ sequenceDiagram
         WS->>WS: register CreationSlot
         WS->>WS: discover component if not in workspace
         WS->>CS: ComponentSession::new
-        CS->>CS: spawn clangd, init LSP, start index monitor
+        CS->>CS: spawn clangd, init LSP, open first translation unit
         WS->>WS: insert into cache
         WS->>Slot: store_result, notify_waiters
         WS-->>Tool: Arc ComponentSession
@@ -155,24 +154,21 @@ The cache lock is held only for the lookup, never across clangd startup, to avoi
 
 | Field | Role |
 |---|---|
-| `build_dir: PathBuf` | The build directory this session represents |
 | `clangd_session: Arc<Mutex<ClangdSession>>` | The clangd process + LSP client |
 | `file_manager: Arc<Mutex<ClangdFileManager>>` | LSP document sync state |
-| `index_monitor: Arc<ComponentIndexMonitor>` | Index state tracking + completion latch |
+| `index_wait_timeout: Duration` | Bound for waiting on clangd's index progress (from `AppConfig`) |
 | `component: ProjectComponent` | Metadata (build type, generator, paths) |
 | `diagnostics_collector: Arc<DiagnosticsCollector>` | Captured `publishDiagnostics` |
 
-Construction (`ComponentSession::new`) is async and does the real work:
-1. Load the `CompilationDatabase` from `component.compilation_database_path`.
-2. Build a `ClangdConfig` via `ClangdConfigBuilder` - working directory is the project root, build directory is the component's build dir, plus `--limit-results` and `--log=verbose` args.
-3. Create a progress-event channel (`PROGRESS_CHANNEL_BUFFER_SIZE = 10_000`).
-4. `ClangdSessionBuilder::new().with_config(config).with_progress_sender(tx).build().await` spawns clangd and initializes LSP.
-5. Register the `DiagnosticsCollector` notification handler on the LSP client.
-6. Create the `ClangdFileManager`.
-7. Create the `ComponentIndexMonitor` (which builds a `ComponentIndex` from the compilation database and clangd version, and wires a `ClangdIndexTrigger`).
-8. Spawn a background task that drains `progress_rx` into `monitor.handle_progress_event`.
+Index status is not stored on the session as a separate field; it is read on demand from the `IndexProgressMonitor` owned by the underlying `ClangdSession` (see [Clangd Session and Indexing](clangd-session.md)). `ComponentSession` exposes `index_status()` and `wait_for_index_status(timeout)` as thin wrappers over the monitor.
 
-The session exposes accessors (`get_index_status`, `component()`, `clangd_session`, `file_manager`, `diagnostics_collector`, `index_monitor`) used by the tools.
+Construction (`ComponentSession::new`) is async and does the real work:
+1. Build a `ClangdConfig` via `ClangdConfigBuilder` from the `AppConfig` clangd settings - working directory is the project root, build directory is the component's build dir. `--log=verbose` is intentionally **not** added: it generates a huge stderr volume and clangd's `$/progress` arrives regardless of log verbosity.
+2. `ClangdSessionBuilder::new().with_config(config).build().await` spawns clangd and initializes LSP.
+3. Register the `DiagnosticsCollector` notification handler on the LSP client.
+4. Open one real translation unit from the compilation database through `ClangdFileManager::ensure_file_ready`, to give a fresh CLI invocation its first compilation context (clangd remains solely responsible for all indexing and progress reporting).
+
+The session exposes accessors (`component()`, `lsp_session`, `ensure_file_ready`, `close_file`, `get_file_diagnostics`, `index_status`, `wait_for_index_status`, `index_wait_timeout`) used by the tools. `ensure_indexed` is a legacy test-only no-op retained for the integration suites - there is no client-side indexing phase anymore.
 
 ## Error model
 

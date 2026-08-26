@@ -11,8 +11,6 @@ openwiki:
     - Dockerfile
     - docker/entrypoint.sh
     - tools/lsp-cli.py
-    - tools/generate-index.py
-    - tools/clangd-idx-viewer.py
     - tools/read-cmake-cache.py
     - test/test-project/CMakeLists.txt
     - test/test-meson-project/meson.build
@@ -68,8 +66,6 @@ Only runtime dep: `rich>=13.0.0` (optional - tools fall back to plain output if 
 | Tool | Purpose | Usage |
 |---|---|---|
 | `lsp-cli.py` | MCP server CLI client with rich output. Supports three transports (spawn, attach via FIFO, streamable-HTTP with SSE + session caching). | `get-index-status`, `search-symbols`, `search-class`, `search-method`, `show-diagnostics`, `analyze-symbol`, `get-project-details` |
-| `generate-index.py` | Drives clangd to produce a background index by mimicking VS Code's LSP init sequence (initialize -> didOpen each file -> wait -> shutdown). | `generate-index.py <build_directory> [--refresh-index] [--clangd-path clangd] [--log-file FILE] [--verbose]` |
-| `clangd-idx-viewer.py` | Parses and displays binary `.idx` files (RIFF CdIx, formats 12-20). Full enum definitions for SymbolKind, RefKind, etc. | `clangd-idx-viewer.py <idx_file> [--raw] [--verbose] [--all] [--summary]` |
 | `read-cmake-cache.py` | ccmake-like viewer for `CMakeCache.txt` showing only user-configurable, non-advanced entries. | `read-cmake-cache.py [path/to/CMakeCache.txt]` |
 
 `lsp-cli.py` is the primary debugging tool - it shows exactly what an AI agent would see from the server. It maintains a per-project `.lsp-cli.json` cache for transport/session auto-reconnect.
@@ -106,7 +102,6 @@ Scheduled `cron: "0 8 * * *"` plus `workflow_dispatch`. Sets up Node 22, install
 
 | Doc | Content |
 |---|---|
-| `docs/clangd_index_spec.md` | Complete binary format spec for `.idx` files (versions 12-20), hash function evolution, RIFF container, varint/position encoding, enum definitions. Reference for `clangd-idx-viewer.py`. |
 | `docs/symbol_context_analyzer_implementation.md` | Implementation plan for `analyze_symbol_context`: input/output schema, LSP call aggregation. |
 | `docs/symbol_search_explorer_implementation.md` | Implementation plan for `search_symbols`: workspace scope, visibility rules, fuzzy matching. |
 

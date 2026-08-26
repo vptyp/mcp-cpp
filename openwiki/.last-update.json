@@ -1,7 +1,7 @@
 {
-  "updatedAt": "2026-08-25T08:40:19.041Z",
-  "command": "init",
-  "gitHead": "fcb4373203f995b6f13f9cf71e80695e0f0702d2",
+  "updatedAt": "2026-08-26T16:21:30.556Z",
+  "command": "update",
+  "gitHead": "a260de82ab15d40086268ee2bba0db4e807b89fa",
   "model": "glm-5.2:cloud",
   "status": "complete",
   "language": "en"
