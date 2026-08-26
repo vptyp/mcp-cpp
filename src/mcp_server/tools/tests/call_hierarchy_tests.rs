@@ -421,7 +421,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
         std_dev_hierarchy
             .callees
             .iter()
-            .any(|c| c.contains("variance")),
+            .any(|c| c.name.contains("variance")),
         "standardDeviation should call variance"
     );
 
@@ -430,7 +430,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
         variance_hierarchy
             .callers
             .iter()
-            .any(|c| c.contains("standardDeviation")),
+            .any(|c| c.name.contains("standardDeviation")),
         "variance should be called by standardDeviation"
     );
 
@@ -440,7 +440,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
         variance_hierarchy
             .callees
             .iter()
-            .any(|c| c.contains("mean")),
+            .any(|c| c.name.contains("mean")),
         "variance should call mean"
     );
 
@@ -449,7 +449,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
         mean_hierarchy
             .callers
             .iter()
-            .any(|c| c.contains("variance")),
+            .any(|c| c.name.contains("variance")),
         "mean should be called by variance"
     );
 
@@ -460,7 +460,7 @@ async fn test_analyzer_call_hierarchy_coherence() {
         mean_hierarchy
             .callers
             .iter()
-            .any(|c| c.contains("variance")),
+            .any(|c| c.name.contains("variance")),
         "mean should be called by variance (completing the call chain)"
     );
 

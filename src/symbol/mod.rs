@@ -7,5 +7,5 @@ mod location;
 #[allow(clippy::module_inception)]
 mod symbol;
 
-pub use location::{FileLocation, uri_from_pathbuf};
+pub use location::{FileLocation, pathbuf_from_uri, uri_from_pathbuf};
 pub use symbol::Symbol;

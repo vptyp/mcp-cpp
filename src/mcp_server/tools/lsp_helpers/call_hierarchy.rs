@@ -11,17 +11,31 @@ use crate::lsp::traits::LspClientTrait;
 use crate::mcp_server::tools::analyze_symbols::AnalyzerError;
 use crate::project::component_session::ComponentSession;
 use crate::symbol::FileLocation;
+use crate::symbol::pathbuf_from_uri;
 
 // ============================================================================
 // Call Hierarchy Types
 // ============================================================================
 
+/// A single caller or callee in the call hierarchy.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CallHierarchyEntry {
+    /// Unqualified symbol name, as clangd reports it (e.g. `AddInfoBar`).
+    pub name: String,
+    /// Qualified context from clangd's `detail` field, when available
+    /// (e.g. `infobars::InfoBarContainer`). `None` if clangd omits it.
+    pub qualified: Option<String>,
+    /// `path:line:col` (1-based) of the symbol's selection range — directly
+    /// usable as `--location-hint` to drill into this entry with `analyze`.
+    pub location: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CallHierarchy {
     /// Functions that call this function (incoming calls)
-    pub callers: Vec<String>,
+    pub callers: Vec<CallHierarchyEntry>,
     /// Functions that this function calls (outgoing calls)
-    pub callees: Vec<String>,
+    pub callees: Vec<CallHierarchyEntry>,
 }
 
 // ============================================================================
@@ -67,7 +81,7 @@ pub async fn get_call_hierarchy(
         .await
         .map_err(AnalyzerError::from)?
         .into_iter()
-        .map(|call| call.from.name)
+        .map(|call| entry_from_item(call.from))
         .collect();
 
     // Get outgoing calls (callees)
@@ -76,8 +90,26 @@ pub async fn get_call_hierarchy(
         .await
         .map_err(AnalyzerError::from)?
         .into_iter()
-        .map(|call| call.to.name)
+        .map(|call| entry_from_item(call.to))
         .collect();
 
     Ok(CallHierarchy { callers, callees })
+}
+
+/// Build a [`CallHierarchyEntry`] from a clangd `CallHierarchyItem`, exposing
+/// the qualified context (`detail`) and a `path:line:col` location ready for
+/// `--location-hint`.
+fn entry_from_item(item: lsp_types::CallHierarchyItem) -> CallHierarchyEntry {
+    let path = pathbuf_from_uri(&item.uri);
+    let start = item.selection_range.start;
+    CallHierarchyEntry {
+        name: item.name,
+        qualified: item.detail,
+        location: format!(
+            "{}:{}:{}",
+            path.display(),
+            start.line + 1,
+            start.character + 1
+        ),
+    }
 }
