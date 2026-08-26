@@ -74,17 +74,21 @@ impl ComponentSession {
         // A fresh, short-lived CLI invocation otherwise has no document activity
         // to give clangd its first compilation context. Open one real translation
         // unit through the normal LSP path; clangd remains solely responsible for
-        // all indexing and progress reporting.
+        // all indexing and progress reporting. The first entry is streamed and
+        // resolved against the database directory (its `file` is often relative,
+        // e.g. Chromium's `../../chrome/...`); opening the raw relative path would
+        // resolve against the process CWD, miss the file, and leave clangd with no
+        // document to start its background index from.
         let mut file_manager = ClangdFileManager::new();
-        if let Ok(database) = CompilationDatabase::new(component.compilation_database_path.clone())
-            && let Some(entry) = database.entries.first()
+        if let Some(first_file) =
+            CompilationDatabase::first_entry_resolved_path(&component.compilation_database_path)
         {
             let mut session = clangd_session.lock().await;
             if let Err(error) = file_manager
-                .ensure_file_ready(&entry.file, session.client_mut())
+                .ensure_file_ready(&first_file, session.client_mut())
                 .await
             {
-                warn!(path = %entry.file.display(), %error, "Failed to seed clangd with a translation unit");
+                warn!(path = %first_file.display(), %error, "Failed to seed clangd with a translation unit");
             }
         }
         info!(build_dir = %component.build_dir_path.display(), "Created clangd session");

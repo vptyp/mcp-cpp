@@ -81,24 +81,6 @@ pub trait ProcessExitHandler: Send + Sync {
 }
 
 // ============================================================================
-// Stderr Monitoring Trait
-// ============================================================================
-
-/// Trait for monitoring stderr output from external processes
-pub trait StderrMonitor: Send + Sync {
-    /// Install a handler for stderr lines
-    ///
-    /// The handler will be called for each line received from stderr.
-    /// Only one handler can be active at a time - installing a new handler
-    /// will replace the previous one.
-    ///
-    /// Note: Monitoring starts automatically when the process starts if a handler is installed.
-    fn on_stderr_line<F>(&mut self, handler: F)
-    where
-        F: Fn(String) + Send + Sync + 'static;
-}
-
-// ============================================================================
 // Process Management
 // ============================================================================
 
@@ -182,6 +164,19 @@ pub struct ChildProcessManager {
 }
 
 impl ChildProcessManager {
+    /// Install a handler for stderr lines.
+    ///
+    /// The handler is called for each line received from the child's stderr.
+    /// Only one handler can be active at a time; installing a new handler
+    /// replaces the previous one. If no handler is installed, stderr output is
+    /// drained and discarded by the wait task.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn on_stderr_line<F>(&mut self, handler: F)
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        self.stderr_handler = Some(Box::new(handler));
+    }
     /// Create a new child process manager
     ///
     /// # Arguments
@@ -496,15 +491,6 @@ impl ProcessManager for ChildProcessManager {
     }
 }
 
-impl StderrMonitor for ChildProcessManager {
-    fn on_stderr_line<F>(&mut self, handler: F)
-    where
-        F: Fn(String) + Send + Sync + 'static,
-    {
-        self.stderr_handler = Some(Box::new(handler));
-    }
-}
-
 // ============================================================================
 // Mock Process Manager (for testing)
 // ============================================================================
@@ -570,16 +556,6 @@ impl ProcessManager for MockProcessManager {
         // Mock implementation - simply reset state like stop()
         self.running = false;
         self.process_id = None;
-    }
-}
-
-#[cfg(test)]
-impl StderrMonitor for MockProcessManager {
-    fn on_stderr_line<F>(&mut self, _callback: F)
-    where
-        F: Fn(String) + Send + Sync + 'static,
-    {
-        // Mock implementation - no-op since we don't have real stderr in tests
     }
 }
 

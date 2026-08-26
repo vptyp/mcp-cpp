@@ -1,12 +1,9 @@
 use json_compilation_db::Entry;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-
-/// Type alias for bidirectional path mappings
-/// (original_path -> canonical_path, canonical_path -> original_path)
-pub type PathMappings = (HashMap<PathBuf, PathBuf>, HashMap<PathBuf, PathBuf>);
 
 /// Aggregated compiler options extracted from a compilation database.
 ///
@@ -118,6 +115,44 @@ impl CompilationDatabase {
     #[allow(dead_code)]
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    /// Resolve the first entry's source file path against the database directory,
+    /// without loading the whole database.
+    ///
+    /// Used to give clangd a first translation unit so its `--background-index`
+    /// pass starts. Loading and holding 70k+ entries just for that would waste
+    /// seconds of startup and gigabytes of RAM, so only the first entry is
+    /// streamed. Relative `file` fields (e.g. Chromium's `../../chrome/...`,
+    /// relative to the compile_commands.json directory) are resolved against the
+    /// database's directory and canonicalized; a missing file falls back to the
+    /// resolved (un-canonicalized) path.
+    pub fn first_entry_resolved_path(db_path: &Path) -> Option<PathBuf> {
+        let file = std::fs::File::open(db_path).ok()?;
+        let mut reader = std::io::BufReader::new(file);
+        // compile_commands.json is a JSON array; `StreamDeserializer` parses a
+        // stream of top-level values, so consume the opening `[` (and any leading
+        // whitespace) first, then each element streams as one value.
+        let mut byte = [0u8; 1];
+        loop {
+            if reader.read(&mut byte).ok()? == 0 {
+                return None;
+            }
+            match byte[0] {
+                b'[' => break,
+                b' ' | b'\n' | b'\r' | b'\t' => continue,
+                _ => return None,
+            }
+        }
+        let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<Entry>();
+        let entry = stream.next()?.ok()?;
+        let db_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+        let resolved = if entry.file.is_relative() {
+            db_dir.join(&entry.file)
+        } else {
+            entry.file.clone()
+        };
+        Some(resolved.canonicalize().unwrap_or(resolved))
     }
 
     /// Get all unique source files with canonicalized paths
@@ -237,25 +272,6 @@ impl CompilationDatabase {
             }
         }
         Ok(common)
-    }
-
-    /// Get bidirectional mappings between original and canonical paths
-    ///
-    /// Returns (original -> canonical, canonical -> original) mappings.
-    /// This enables efficient lookup in both directions without repeated canonicalization.
-    pub fn path_mappings(&self) -> Result<PathMappings, CompilationDatabaseError> {
-        let mut original_to_canonical = HashMap::new();
-        let mut canonical_to_original = HashMap::new();
-
-        for entry in &self.entries {
-            let original_path = entry.file.clone();
-            let canonical_path = self.canonicalize_entry_path(&entry.file)?;
-
-            original_to_canonical.insert(original_path.clone(), canonical_path.clone());
-            canonical_to_original.insert(canonical_path, original_path);
-        }
-
-        Ok((original_to_canonical, canonical_to_original))
     }
 
     /// Canonicalize a single entry path using the same logic for all paths

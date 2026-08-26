@@ -239,26 +239,6 @@ pub mod integration {
             })
         }
 
-        /// Create a new standalone Meson test project
-        #[cfg(any(
-            feature = "project-integration-tests",
-            feature = "clangd-integration-tests"
-        ))]
-        pub async fn new_meson() -> Result<Self, std::io::Error> {
-            // Create temp directory (auto-cleanup on drop)
-            let temp_dir = TempDir::new()?;
-            let project_root = temp_dir.path().to_path_buf();
-            let build_dir =
-                Self::init_project(&project_root, "test/test-meson-project", "builddir").await?;
-
-            Ok(TestProject {
-                _temp_dir: Some(temp_dir),
-                project_root,
-                build_dir,
-                project_type: ProjectType::Meson,
-            })
-        }
-
         /// Create a test project at a specific path (used by TestWorkspace)
         #[cfg_attr(not(feature = "project-integration-tests"), allow(dead_code))]
         pub(super) async fn create_at(
